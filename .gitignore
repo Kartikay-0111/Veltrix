@@ -1,0 +1,120 @@
+# Python Cache & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+.hypothesis/
+
+# Node Modules
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
+
+# Docker Volumes (local data - never commit)
+**/postgres_data/
+**/redis_data/
+**/minio_data/
+**/mongo_data/
+
+# Docker Compose Overrides
+docker-compose.override.yml
+docker-compose.local.yml
+**/docker-compose.override.yml
+**/docker-compose.local.yml
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+.settings/
+*.iml
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.cab
+*.msi
+*.msix
+*.msixbundle
+*.msp
+*.lnk
+
+# Temporary & Build Files
+*.tmp
+*.bak
+*.backup
+*~
+.~*
+temp/
+tmp/
+dist/
+build/
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Test & Coverage
+.pytest_cache/
+.coverage
+coverage.xml
+*.cover
+htmlcov/
+
+# Misc
+*.orig
+.vscode-server/
+.history/
+.env.local
+.env.*.local
+
+# Large Archives
+*.tar.gz
+*.zip
+*.tar
+*.rar
+
+# Benchmark & Result Files
+benchmarks/
+results/
+*.out
+
+# IDE Caches
+.cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local development
+override.yml
+local-config/
+
+# Secrets (uncomment if needed for production)
+# .env.production
+# .env.secret
+# secrets/

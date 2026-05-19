@@ -1,0 +1,124 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Virtual environments
+.venv
+.env.local
+.env.*.local
+
+# Docker
+docker-compose.override.yml
+.docker/
+
+# Docker volumes (local data - never commit)
+postgres_data/
+redis_data/
+minio_data/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+.settings/
+*.iml
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.cab
+*.msi
+*.msix
+*.msixbundle
+*.msp
+*.lnk
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*~
+.~*
+temp/
+tmp/
+
+# Node (if frontend is added later)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Secrets & Credentials (for production .env files)
+# Note: Development .env IS committed (for easy setup)
+# Uncommit this if you add production secrets
+# .env.production
+# .env.secrets
+# secrets/
+
+# Misc
+*.orig
+.vscode-server/
+.history/
+
+# Test & Build artifacts
+.pytest_cache/
+.tox/
+coverage.xml
+*.cover
+.hypothesis/
+build/
+dist/
+
+# Local development overrides
+docker-compose.local.yml
+override.yml
+
+# Benchmark results (if generated)
+benchmarks/
+results/
+
+# Large files
+*.tar.gz
+*.zip
+*.tar
+
+# Database backups
+*.dump
+*.sql.gz
+*.backup

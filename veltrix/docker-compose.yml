@@ -1,0 +1,95 @@
+# docker-compose.yml
+networks:
+  backend:
+    driver: bridge
+  sandbox-net:   
+    name: sandbox-net       # isolated network for contestant containers
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  redis_data:
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    restart: always
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      retries: 5
+
+  # ── Your Services ────────────────────────────────────────────────
+  submission-service:
+    build: ./submission-service
+    restart: always
+    env_file: .env
+    ports:
+      - "8080:8080"
+    networks: [backend]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      minio:    { condition: service_healthy }
+
+  sandbox-manager:
+    build: ./sandbox-manager
+    restart: always
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED : 1
+      SANDBOX_HOST: host.docker.internal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # needs Docker access
+    networks:
+      - backend
+      - sandbox-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
