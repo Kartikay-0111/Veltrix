@@ -4,7 +4,7 @@ from pathlib import PurePosixPath
 from docker.errors import NotFound, APIError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-print("🔥 Sandbox Manager booting up...", flush=True)
+print("Sandbox Manager booting up...", flush=True)
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env")
