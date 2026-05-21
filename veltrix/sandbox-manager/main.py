@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     max_extract_size_mb: int = 200
     max_file_size_mb: int = 50
     max_file_count: int = 500
+    fleet_commander_url: str = "http://bot-fleet:7070"
+    # Benchmark defaults (can be overridden per-job)
+    default_num_bots: int = 100
+    default_duration_secs: int = 60
+
+    class Config:
+        env_file = ".env"
 
 cfg = Settings()
 
@@ -300,6 +307,38 @@ def map_exit_code_to_status(exit_code: int) -> str:
     }
     return mapping.get(exit_code, "FAILED_LOGIC")
 
+async def trigger_fleet_commander(submission_id: str, host: str, port: str,
+                                   num_bots: int, duration_secs: int):
+    """
+    POST to the C++ Fleet Commander with benchmark parameters.
+    The Fleet Commander then:
+      - Detects CPU cores
+      - Divides bots across cores
+      - Starts io_uring workers
+      - Streams metrics to Redpanda
+    """
+    payload = {
+        "submission_id":  submission_id,
+        "target_host":    host,
+        "target_port":    port,
+        "num_bots":       num_bots,
+        "duration_secs":  duration_secs,
+        "protocol":       "rest"
+    }
+ 
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{cfg.fleet_commander_url}/benchmark",
+                json=payload
+            )
+            if resp.status_code == 202:
+                print(f"[INFO] Fleet Commander accepted benchmark for {submission_id}")
+            else:
+                print(f"[WARN] Fleet Commander returned {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[ERROR] Failed to trigger Fleet Commander: {e}")
+
 async def process_submission(submission_id: str):
     db = await get_db()
     container = None
@@ -419,6 +458,16 @@ async def process_submission(submission_id: str):
             endpoint_url=endpoint_url
         )
         print(f"[INFO] Sandbox READY → {endpoint_url}")
+
+        await trigger_fleet_commander(
+            submission_id = submission_id,
+            host          = "localhost",
+            port          = str(host_port),
+            num_bots      = cfg.default_num_bots,
+            duration_secs = cfg.default_duration_secs
+        )
+
+        await update_submission(db, submission_id, status="RUNNING")
 
     except Exception as e:
         # Catch-all for anything unexpected — platform fault, not contestant fault

@@ -62,7 +62,43 @@ services:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
       retries: 5
-
+    # ── Redpanda (Kafka-compatible message bus) ────────────────────────────────
+  redpanda:
+    image: redpandadata/redpanda:latest
+    restart: always
+    command:
+      - redpanda
+      - start
+      - --smp=1                          # 1 CPU core for local dev
+      - --memory=512M
+      - --overprovisioned
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+      - --pandaproxy-addr=0.0.0.0:8082  # HTTP proxy for debugging
+    volumes: [redpanda_data:/var/lib/redpanda/data]
+    ports:
+      - "9092:9092"   # Kafka API (used by bot fleet producer)
+      - "8082:8082"   # Pandaproxy (HTTP → produce/consume for debugging)
+      - "9644:9644"   # Admin API
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info"]
+      interval: 10s
+      retries: 5
+ 
+  # Create the order_metrics topic on startup
+  redpanda-init:
+    image: redpandadata/redpanda:latest
+    depends_on:
+      redpanda: { condition: service_healthy }
+    entrypoint: >
+      bash -c "
+        rpk topic create order_metrics
+          --brokers redpanda:9092
+          --partitions 6
+          --replicas 1 || true
+      "
+    networks: [backend] 
   # ── Your Services ────────────────────────────────────────────────
   submission-service:
     build: ./submission-service
@@ -81,6 +117,9 @@ services:
     restart: always
     env_file: .env
     environment:
+      FLEET_COMMANDER_URL: http://bot-fleet:7070
+      DEFAULT_NUM_BOTS: 100
+      DEFAULT_DURATION_SECS: 60
       PYTHONUNBUFFERED : 1
       SANDBOX_HOST: host.docker.internal
     volumes:
@@ -93,3 +132,24 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
+      bot-fleet: { condition: service_started }
+
+
+  bot-fleet:
+    build: ./bot-fleet
+    restart: always
+    environment:
+      FLEET_LISTEN_PORT: 7070
+      REDPANDA_BROKERS:  redpanda:9092
+    ports:
+      - "7070:7070"   # FleetCommander HTTP trigger endpoint
+    networks: [backend]
+    depends_on:
+      redpanda: { condition: service_healthy }
+    # io_uring requires these kernel capabilities
+    cap_add:
+      - SYS_NICE       # for CPU pinning (pthread_setaffinity_np)
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536    # allow 65k open file descriptors (one per bot socket)
