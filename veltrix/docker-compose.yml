@@ -10,6 +10,7 @@ volumes:
   postgres_data:
   minio_data:
   redis_data:
+  redpanda_data:
 
 services:
 
@@ -91,13 +92,7 @@ services:
     image: redpandadata/redpanda:latest
     depends_on:
       redpanda: { condition: service_healthy }
-    entrypoint: >
-      bash -c "
-        rpk topic create order_metrics
-          --brokers redpanda:9092
-          --partitions 6
-          --replicas 1 || true
-      "
+    entrypoint: ["bash", "-lc", "rpk topic create order_metrics --brokers redpanda:9092 --partitions 6 --replicas 1 || true"]
     networks: [backend] 
   # ── Your Services ────────────────────────────────────────────────
   submission-service:
@@ -111,6 +106,23 @@ services:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
       minio:    { condition: service_healthy }
+
+  telemetry-ingester:
+    build: ./telemetry-ingester
+    restart: always
+    env_file: .env
+    environment:
+      REDPANDA_PROXY_URL: http://redpanda:8082
+      REDPANDA_TOPIC: order_metrics
+    ports:
+      - "8090:8090"
+    networks: [backend]
+    depends_on:
+      redpanda: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health').read()"]
+      interval: 5s
+      retries: 5
 
   sandbox-manager:
     build: ./sandbox-manager
@@ -140,16 +152,22 @@ services:
     restart: always
     environment:
       FLEET_LISTEN_PORT: 7070
-      REDPANDA_BROKERS:  redpanda:9092
+      TELEMETRY_INGESTER_HOST: telemetry-ingester
+      TELEMETRY_INGESTER_PORT: 8090
     ports:
       - "7070:7070"   # FleetCommander HTTP trigger endpoint
     networks: [backend]
     depends_on:
-      redpanda: { condition: service_healthy }
+      telemetry-ingester: { condition: service_healthy }
     # io_uring requires these kernel capabilities
     cap_add:
       - SYS_NICE       # for CPU pinning (pthread_setaffinity_np)
+    security_opt:
+      - seccomp=unconfined      # Disables Docker's filter, allowing io_uring system calls
     ulimits:
+      memlock:
+        soft: -1                # Allows io_uring to lock unlimited memory in RAM
+        hard: -1
       nofile:
-        soft: 65536
-        hard: 65536    # allow 65k open file descriptors (one per bot socket)
+        soft: 65536             # Allows the bots to open 65,000 concurrent sockets
+        hard: 65536   # allow 65k open file descriptors (one per bot socket)

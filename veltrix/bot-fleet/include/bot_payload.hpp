@@ -16,9 +16,15 @@
 // leak in polymorphic hierarchies.
 // ─────────────────────────────────────────────────────────────────────────────
 
-enum class OrderType { LIMIT, MARKET, CANCEL };
+enum class OrderType
+{
+    LIMIT,
+    MARKET,
+    CANCEL
+};
 
-struct BotPayload {
+struct BotPayload
+{
     virtual ~BotPayload() = default;
 
     // Must produce a ready-to-send request string (HTTP body or WS frame)
@@ -30,5 +36,5 @@ struct BotPayload {
     // Target endpoint this bot hammers
     std::string target_host;
     std::string target_port;
-    std::string target_path = "/order";  // REST endpoint on contestant's server
+    std::string target_path = "/order"; // REST endpoint on contestant's server
 };

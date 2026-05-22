@@ -18,10 +18,10 @@ find_package(Boost 1.78 REQUIRED COMPONENTS system)
 find_package(Threads REQUIRED)
 
 # ── liburing (io_uring userspace library) ─────────────────────────────────────
-find_library(URING_LIB uring REQUIRED)
-
-# ── librdkafka (Redpanda/Kafka producer) ──────────────────────────────────────
-find_library(RDKAFKA_LIB rdkafka REQUIRED)
+find_library(URING_LIB NAMES uring)
+if(NOT URING_LIB)
+    message(FATAL_ERROR "liburing not found. Install liburing-dev or provide -luring")
+endif()
 
 # ── Source files ──────────────────────────────────────────────────────────────
 set(SOURCES
@@ -41,7 +41,6 @@ target_link_libraries(bot_fleet
     Boost::system
     Threads::Threads
     ${URING_LIB}      # -luring
-    ${RDKAFKA_LIB}    # -lrdkafka
 )
 
 # ── Tell Boost.Asio to use io_uring instead of epoll ─────────────────────────

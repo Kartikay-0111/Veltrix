@@ -1,3 +1,15 @@
 https://youtu.be/JR0vJeth_1k?si=Z1pWhatpmMZVtfQ0
-https://www.notion.so/snow-tech/io_uring-The-Modern-Asynchronous-I-O-Revolution-in-Linux-26087f33e3ad81ff90cdc71948aa9d8d
-https://youtu.be/WizG3TT-zHo?si=MzWzzLIKqJ8dO9Qo
+Day 1  →  bot_payload.hpp → rest_bot.hpp → rest_bot.cpp
+           (OOP video + mt19937 article)
+
+Day 2  →  telemetry.hpp → telemetry.cpp
+           (mutex article, then re-read the flush logic)
+
+Day 3  →  thread_worker.hpp → thread_worker.cpp
+           (io_uring article → Asio playlist videos 1+5 → production talk)
+
+Day 4  →  fleet_commander.hpp → fleet_commander.cpp
+           (Boost.Beast video)
+
+Day 5  →  CMakeLists.txt → Dockerfile → main.cpp
+           (CMake video + Docker multi-stage article)

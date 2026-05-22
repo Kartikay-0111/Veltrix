@@ -1,6 +1,6 @@
 #pragma once
 
-#define BOOST_ASIO_HAS_IO_URING  1
+#define BOOST_ASIO_HAS_IO_URING 1
 #define BOOST_ASIO_DISABLE_EPOLL 1
 
 #include <boost/asio.hpp>
@@ -12,10 +12,10 @@
 #include "thread_worker.hpp"
 #include "telemetry.hpp"
 
-namespace asio  = boost::asio;
+namespace asio = boost::asio;
 namespace beast = boost::beast;
-namespace http  = beast::http;
-using tcp       = asio::ip::tcp;
+namespace http = beast::http;
+using tcp = asio::ip::tcp;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FleetCommander — HTTP server that receives the start signal
@@ -29,31 +29,34 @@ using tcp       = asio::ip::tcp;
 //   5. Waits for duration to expire
 //   6. Stops all workers cleanly
 // ─────────────────────────────────────────────────────────────────────────────
-class FleetCommander {
+class FleetCommander
+{
 public:
-    explicit FleetCommander(uint16_t    listen_port,
-                            std::string redpanda_brokers);
+    explicit FleetCommander(uint16_t listen_port,
+                            std::string telemetry_ingester_host,
+                            std::string telemetry_ingester_port);
 
     // Blocking — runs the HTTP server forever
     void run();
 
 private:
-    uint16_t    listen_port_;
-    std::string redpanda_brokers_;
+    uint16_t listen_port_;
+    std::string telemetry_ingester_host_;
+    std::string telemetry_ingester_port_;
     asio::io_context ioc_;
 
     // Handle one incoming HTTP connection
     asio::awaitable<void> handle_connection(tcp::socket socket);
 
     // Parse the JSON body from /benchmark POST
-    BenchmarkConfig parse_benchmark_request(const std::string& body);
+    BenchmarkConfig parse_benchmark_request(const std::string &body);
 
     // Core orchestration: spawn workers, wait, stop
-    void launch_benchmark(const BenchmarkConfig& cfg);
+    void launch_benchmark(const BenchmarkConfig &cfg);
 
     // Parse a single JSON string value: {"key":"value"} → value
-    std::string extract_json_string(const std::string& json,
-                                    const std::string& key);
-    int         extract_json_int(const std::string& json,
-                                 const std::string& key);
+    std::string extract_json_string(const std::string &json,
+                                    const std::string &key);
+    int extract_json_int(const std::string &json,
+                         const std::string &key);
 };

@@ -6,7 +6,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     libboost-all-dev \
     liburing-dev \
-    librdkafka-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -23,7 +22,6 @@ FROM ubuntu:24.04 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-system1.83.0 \
     liburing2 \
-    librdkafka1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -33,6 +31,7 @@ COPY --from=builder /build/build/bot_fleet .
 EXPOSE 7070
 
 ENV FLEET_LISTEN_PORT=7070
-ENV REDPANDA_BROKERS=redpanda:9092
+ENV TELEMETRY_INGESTER_HOST=telemetry-ingester
+ENV TELEMETRY_INGESTER_PORT=8090
 
 CMD ["./bot_fleet"]
