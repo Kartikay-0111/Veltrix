@@ -56,17 +56,17 @@ asio::awaitable<void> FleetCommander::handle_connection(tcp::socket socket)
 
         co_await http::async_read(socket, buffer, req, asio::use_awaitable);
 
-        if (req.method() == http::verb::get &&
-            req.target() == "/health")
-        {
-            // Health check endpoint for Docker/K8s probes
-            http::response<http::string_body> res{http::status::ok, req.version()};
-            res.set(http::field::content_type, "application/json");
-            res.body() = "{\"status\":\"ok\"}";
-            res.prepare_payload();
-            co_await http::async_write(socket, res, asio::use_awaitable);
-            co_return;
-        }
+        // if (req.method() == http::verb::get &&
+        //     req.target() == "/health")
+        // {
+        //     // Health check endpoint for Docker/K8s probes
+        //     http::response<http::string_body> res{http::status::ok, req.version()};
+        //     res.set(http::field::content_type, "application/json");
+        //     res.body() = "{\"status\":\"ok\"}";
+        //     res.prepare_payload();
+        //     co_await http::async_write(socket, res, asio::use_awaitable);
+        //     co_return;
+        // }
 
         if (req.method() == http::verb::post &&
             req.target() == "/benchmark")

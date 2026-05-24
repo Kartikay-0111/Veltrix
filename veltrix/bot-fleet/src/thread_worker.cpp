@@ -1,6 +1,8 @@
 #include "thread_worker.hpp"
 #include "rest_bot.hpp"
 #include <iostream>
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <pthread.h>
 #include <sched.h>
@@ -125,26 +127,21 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
             co_await asio::async_write(socket,
                                        asio::buffer(request), asio::use_awaitable);
 
-            // ── Read response with a 1s timeout ──────────────────────────────
+            // ── Read response headers with a 1s timeout ──────────────────────
             asio::steady_timer timeout_timer(executor, 1s);
-            std::string response_buf(4096, '\0');
+            asio::streambuf response_buf;
 
-            // Race: whichever completes first — read or timeout
             bool timed_out = false;
-            std::size_t n = 0;
+            std::size_t header_bytes = 0;
             try
             {
                 auto res = co_await (
-                    socket.async_read_some(asio::buffer(response_buf), asio::use_awaitable) || timeout_timer.async_wait(asio::use_awaitable));
-                // res is a std::variant<size_t, std::monostate>
+                    asio::async_read_until(socket, response_buf, "\r\n\r\n", asio::use_awaitable) ||
+                    timeout_timer.async_wait(asio::use_awaitable));
                 if (res.index() == 0)
-                {
-                    n = std::get<0>(res);
-                }
+                    header_bytes = std::get<0>(res);
                 else
-                {
                     timed_out = true;
-                }
             }
             catch (const boost::system::system_error &e)
             {
@@ -159,13 +156,39 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
             {
                 ++counters_.counts[TIMEOUT];
                 counters_.record_latency(1000.0); // penalise timeout as 1s
+                continue;
             }
-            else
+
+            std::string header;
+            header.resize(header_bytes);
+            std::istream header_stream(&response_buf);
+            header_stream.read(&header[0], static_cast<std::streamsize>(header_bytes));
+
+            int status = parse_status_code(header);
+            std::size_t content_length = parse_content_length(header);
+
+            // Drain any response body so the keep-alive socket stays in sync.
+            std::size_t buffered = response_buf.size();
+            if (buffered < content_length)
             {
-                response_buf.resize(n);
-                int status = parse_status_code(response_buf);
-                record(status, lat, false);
+                const std::size_t remaining = content_length - buffered;
+                try
+                {
+                    co_await asio::async_read(
+                        socket,
+                        response_buf,
+                        asio::transfer_exactly(remaining),
+                        asio::use_awaitable);
+                }
+                catch (const boost::system::system_error &e)
+                {
+                    ++counters_.counts[OTHER_ERR];
+                    continue;
+                }
             }
+            response_buf.consume(response_buf.size());
+
+            record(status, lat, false);
         }
         catch (const boost::system::system_error &e)
         {
@@ -196,6 +219,34 @@ asio::awaitable<void> ThreadWorker::flush_loop()
 
         // Reset counters for next window
         counters_.reset();
+    }
+}
+
+static std::size_t parse_content_length(const std::string &header)
+{
+    std::string lower = header;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c)
+                   { return static_cast<char>(std::tolower(c)); });
+
+    const std::string key = "content-length:";
+    const auto pos = lower.find(key);
+    if (pos == std::string::npos)
+        return 0;
+
+    auto start = pos + key.size();
+    while (start < lower.size() && std::isspace(static_cast<unsigned char>(lower[start])))
+        ++start;
+
+    auto end = lower.find("\r\n", start);
+    const auto len_text = lower.substr(start, end - start);
+    try
+    {
+        return static_cast<std::size_t>(std::stoul(len_text));
+    }
+    catch (...)
+    {
+        return 0;
     }
 }
 

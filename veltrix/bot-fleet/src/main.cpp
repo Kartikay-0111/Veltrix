@@ -22,6 +22,9 @@ static std::string getenv_or(const char *key, const char *fallback)
 
 int main()
 {
+    std::cout.setf(std::ios::unitbuf);
+    std::cerr.setf(std::ios::unitbuf);
+
     uint16_t port = static_cast<uint16_t>(
         std::stoi(getenv_or("FLEET_LISTEN_PORT", "7070")));
 

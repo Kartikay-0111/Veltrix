@@ -3,6 +3,8 @@
 #include <atomic>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cmath>
+#include <cctype>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -65,14 +67,13 @@ struct TradeInfo
 class Trade
 {
 public:
-    Trade(const TradeInfo& bidTrade, const TradeInfo& askTrade)
-        : bidTrade_{ bidTrade }
-        , askTrade_{ askTrade }
+    Trade(const TradeInfo &bidTrade, const TradeInfo &askTrade)
+        : bidTrade_{bidTrade}, askTrade_{askTrade}
     {
     }
 
-    const TradeInfo& GetBidTrade() const { return bidTrade_; }
-    const TradeInfo& GetAskTrade() const { return askTrade_; }
+    const TradeInfo &GetBidTrade() const { return bidTrade_; }
+    const TradeInfo &GetAskTrade() const { return askTrade_; }
 
 private:
     TradeInfo bidTrade_{};
@@ -92,14 +93,13 @@ using LevelInfos = std::vector<LevelInfo>;
 class OrderbookLevelInfos
 {
 public:
-    OrderbookLevelInfos(const LevelInfos& bids, const LevelInfos& asks)
-        : bids_{ bids }
-        , asks_{ asks }
+    OrderbookLevelInfos(const LevelInfos &bids, const LevelInfos &asks)
+        : bids_{bids}, asks_{asks}
     {
     }
 
-    const LevelInfos& GetBids() const { return bids_; }
-    const LevelInfos& GetAsks() const { return asks_; }
+    const LevelInfos &GetBids() const { return bids_; }
+    const LevelInfos &GetAsks() const { return asks_; }
 
 private:
     LevelInfos bids_{};
@@ -110,12 +110,7 @@ class Order
 {
 public:
     Order(OrderType orderType, OrderId orderId, Side side, Price price, Quantity quantity)
-        : orderType_{ orderType }
-        , orderId_{ orderId }
-        , side_{ side }
-        , price_{ price }
-        , initialQuantity_{ quantity }
-        , remainingQuantity_{ quantity }
+        : orderType_{orderType}, orderId_{orderId}, side_{side}, price_{price}, initialQuantity_{quantity}, remainingQuantity_{quantity}
     {
     }
 
@@ -166,10 +161,7 @@ class OrderModify
 {
 public:
     OrderModify(OrderId orderId, Side side, Price price, Quantity quantity)
-        : orderId_{ orderId }
-        , price_{ price }
-        , side_{ side }
-        , quantity_{ quantity }
+        : orderId_{orderId}, price_{price}, side_{side}, quantity_{quantity}
     {
     }
 
@@ -195,14 +187,14 @@ class Orderbook
 private:
     struct OrderEntry
     {
-        OrderPointer order_{ nullptr };
+        OrderPointer order_{nullptr};
         OrderPointers::iterator location_;
     };
 
     struct LevelData
     {
-        Quantity quantity_{ 0 };
-        std::int64_t count_{ 0 };
+        Quantity quantity_{0};
+        std::int64_t count_{0};
 
         enum class Action
         {
@@ -219,7 +211,7 @@ private:
     mutable std::mutex ordersMutex_;
     std::thread ordersPruneThread_;
     std::condition_variable shutdownConditionVariable_;
-    std::atomic<bool> shutdown_{ false };
+    std::atomic<bool> shutdown_{false};
 
     void PruneGoodForDayOrders()
     {
@@ -244,7 +236,7 @@ private:
             auto till = next - now + milliseconds(100);
 
             {
-                std::unique_lock ordersLock{ ordersMutex_ };
+                std::unique_lock ordersLock{ordersMutex_};
 
                 if (shutdown_.load(std::memory_order_acquire) ||
                     shutdownConditionVariable_.wait_for(ordersLock, till) == std::cv_status::no_timeout)
@@ -254,11 +246,11 @@ private:
             OrderIds orderIds;
 
             {
-                std::scoped_lock ordersLock{ ordersMutex_ };
+                std::scoped_lock ordersLock{ordersMutex_};
 
-                for (const auto& [_, entry] : orders_)
+                for (const auto &[_, entry] : orders_)
                 {
-                    const auto& order = entry.order_;
+                    const auto &order = entry.order_;
                     if (order->GetOrderType() != OrderType::GoodForDay)
                         continue;
 
@@ -272,9 +264,9 @@ private:
 
     void CancelOrders(OrderIds orderIds)
     {
-        std::scoped_lock ordersLock{ ordersMutex_ };
+        std::scoped_lock ordersLock{ordersMutex_};
 
-        for (const auto& orderId : orderIds)
+        for (const auto &orderId : orderIds)
             CancelOrderInternal(orderId);
     }
 
@@ -284,7 +276,7 @@ private:
         if (orderIt == orders_.end())
             return;
 
-        const auto& [order, iterator] = orderIt->second;
+        const auto &[order, iterator] = orderIt->second;
         orders_.erase(orderIt);
 
         if (order->GetSide() == Side::Sell)
@@ -293,7 +285,7 @@ private:
             auto levelIt = asks_.find(price);
             if (levelIt != asks_.end())
             {
-                auto& orders = levelIt->second;
+                auto &orders = levelIt->second;
                 orders.erase(iterator);
                 if (orders.empty())
                     asks_.erase(levelIt);
@@ -305,7 +297,7 @@ private:
             auto levelIt = bids_.find(price);
             if (levelIt != bids_.end())
             {
-                auto& orders = levelIt->second;
+                auto &orders = levelIt->second;
                 orders.erase(iterator);
                 if (orders.empty())
                     bids_.erase(levelIt);
@@ -332,9 +324,10 @@ private:
 
     void UpdateLevelData(Price price, Quantity quantity, LevelData::Action action)
     {
-        auto& data = data_[price];
+        auto &data = data_[price];
 
-        data.count_ += action == LevelData::Action::Remove ? -1 : action == LevelData::Action::Add ? 1 : 0;
+        data.count_ += action == LevelData::Action::Remove ? -1 : action == LevelData::Action::Add ? 1
+                                                                                                   : 0;
         if (action == LevelData::Action::Remove || action == LevelData::Action::Match)
             data.quantity_ -= quantity;
         else
@@ -350,12 +343,12 @@ private:
 
         if (side == Side::Buy)
         {
-            for (const auto& [askPrice, orders] : asks_)
+            for (const auto &[askPrice, orders] : asks_)
             {
                 if (askPrice > price)
                     break;
 
-                for (const auto& order : orders)
+                for (const auto &order : orders)
                 {
                     available += order->GetRemainingQuantity();
                     if (available >= quantity)
@@ -365,12 +358,12 @@ private:
         }
         else
         {
-            for (const auto& [bidPrice, orders] : bids_)
+            for (const auto &[bidPrice, orders] : bids_)
             {
                 if (bidPrice < price)
                     break;
 
-                for (const auto& order : orders)
+                for (const auto &order : orders)
                 {
                     available += order->GetRemainingQuantity();
                     if (available >= quantity)
@@ -389,14 +382,14 @@ private:
             if (asks_.empty())
                 return false;
 
-            const auto& [bestAsk, _] = *asks_.begin();
+            const auto &[bestAsk, _] = *asks_.begin();
             return price >= bestAsk;
         }
 
         if (bids_.empty())
             return false;
 
-        const auto& [bestBid, _] = *bids_.begin();
+        const auto &[bestBid, _] = *bids_.begin();
         return price <= bestBid;
     }
 
@@ -410,8 +403,8 @@ private:
             if (bids_.empty() || asks_.empty())
                 break;
 
-            auto& [bidPrice, bids] = *bids_.begin();
-            auto& [askPrice, asks] = *asks_.begin();
+            auto &[bidPrice, bids] = *bids_.begin();
+            auto &[askPrice, asks] = *asks_.begin();
 
             if (bidPrice < askPrice)
                 break;
@@ -439,9 +432,8 @@ private:
                 }
 
                 trades.push_back(Trade{
-                    TradeInfo{ bid->GetOrderId(), bid->GetPrice(), quantity },
-                    TradeInfo{ ask->GetOrderId(), ask->GetPrice(), quantity }
-                });
+                    TradeInfo{bid->GetOrderId(), bid->GetPrice(), quantity},
+                    TradeInfo{ask->GetOrderId(), ask->GetPrice(), quantity}});
 
                 OnOrderMatched(bid->GetPrice(), quantity, bid->IsFilled());
                 OnOrderMatched(ask->GetPrice(), quantity, ask->IsFilled());
@@ -462,16 +454,16 @@ private:
 
         if (!bids_.empty())
         {
-            auto& [_, bids] = *bids_.begin();
-            auto& order = bids.front();
+            auto &[_, bids] = *bids_.begin();
+            auto &order = bids.front();
             if (order->GetOrderType() == OrderType::FillAndKill)
                 CancelOrder(order->GetOrderId());
         }
 
         if (!asks_.empty())
         {
-            auto& [_, asks] = *asks_.begin();
-            auto& order = asks.front();
+            auto &[_, asks] = *asks_.begin();
+            auto &order = asks.front();
             if (order->GetOrderType() == OrderType::FillAndKill)
                 CancelOrder(order->GetOrderId());
         }
@@ -481,14 +473,15 @@ private:
 
 public:
     Orderbook()
-        : ordersPruneThread_{ [this] { PruneGoodForDayOrders(); } }
+        : ordersPruneThread_{[this]
+                             { PruneGoodForDayOrders(); }}
     {
     }
 
-    Orderbook(const Orderbook&) = delete;
-    void operator=(const Orderbook&) = delete;
-    Orderbook(Orderbook&&) = delete;
-    void operator=(Orderbook&&) = delete;
+    Orderbook(const Orderbook &) = delete;
+    void operator=(const Orderbook &) = delete;
+    Orderbook(Orderbook &&) = delete;
+    void operator=(Orderbook &&) = delete;
 
     ~Orderbook()
     {
@@ -500,7 +493,7 @@ public:
 
     Trades AddOrder(OrderPointer order)
     {
-        std::scoped_lock ordersLock{ ordersMutex_ };
+        std::scoped_lock ordersLock{ordersMutex_};
 
         if (orders_.find(order->GetOrderId()) != orders_.end())
             return {};
@@ -509,12 +502,12 @@ public:
         {
             if (order->GetSide() == Side::Buy && !asks_.empty())
             {
-                const auto& [worstAsk, _] = *asks_.rbegin();
+                const auto &[worstAsk, _] = *asks_.rbegin();
                 order->ToGoodTillCancel(worstAsk);
             }
             else if (order->GetSide() == Side::Sell && !bids_.empty())
             {
-                const auto& [worstBid, _] = *bids_.rbegin();
+                const auto &[worstBid, _] = *bids_.rbegin();
                 order->ToGoodTillCancel(worstBid);
             }
             else
@@ -533,18 +526,18 @@ public:
 
         if (order->GetSide() == Side::Buy)
         {
-            auto& orders = bids_[order->GetPrice()];
+            auto &orders = bids_[order->GetPrice()];
             orders.push_back(order);
             iterator = std::prev(orders.end());
         }
         else
         {
-            auto& orders = asks_[order->GetPrice()];
+            auto &orders = asks_[order->GetPrice()];
             orders.push_back(order);
             iterator = std::prev(orders.end());
         }
 
-        orders_.insert({ order->GetOrderId(), OrderEntry{ order, iterator } });
+        orders_.insert({order->GetOrderId(), OrderEntry{order, iterator}});
 
         OnOrderAdded(order);
 
@@ -553,7 +546,7 @@ public:
 
     void CancelOrder(OrderId orderId)
     {
-        std::scoped_lock ordersLock{ ordersMutex_ };
+        std::scoped_lock ordersLock{ordersMutex_};
         CancelOrderInternal(orderId);
     }
 
@@ -562,12 +555,12 @@ public:
         OrderType orderType;
 
         {
-            std::scoped_lock ordersLock{ ordersMutex_ };
+            std::scoped_lock ordersLock{ordersMutex_};
 
             if (orders_.find(order.GetOrderId()) == orders_.end())
                 return {};
 
-            const auto& [existingOrder, _] = orders_.at(order.GetOrderId());
+            const auto &[existingOrder, _] = orders_.at(order.GetOrderId());
             orderType = existingOrder->GetOrderType();
         }
 
@@ -577,13 +570,13 @@ public:
 
     std::size_t Size() const
     {
-        std::scoped_lock ordersLock{ ordersMutex_ };
+        std::scoped_lock ordersLock{ordersMutex_};
         return orders_.size();
     }
 
     bool HasOrder(OrderId orderId) const
     {
-        std::scoped_lock ordersLock{ ordersMutex_ };
+        std::scoped_lock ordersLock{ordersMutex_};
         return orders_.find(orderId) != orders_.end();
     }
 
@@ -593,20 +586,20 @@ public:
         bidInfos.reserve(bids_.size());
         askInfos.reserve(asks_.size());
 
-        auto createLevelInfo = [](Price price, const OrderPointers& orders)
+        auto createLevelInfo = [](Price price, const OrderPointers &orders)
         {
-            return LevelInfo{ price, std::accumulate(orders.begin(), orders.end(), static_cast<Quantity>(0),
-                [](Quantity runningSum, const OrderPointer& order)
-                { return runningSum + order->GetRemainingQuantity(); }) };
+            return LevelInfo{price, std::accumulate(orders.begin(), orders.end(), static_cast<Quantity>(0),
+                                                    [](Quantity runningSum, const OrderPointer &order)
+                                                    { return runningSum + order->GetRemainingQuantity(); })};
         };
 
-        for (const auto& [price, orders] : bids_)
+        for (const auto &[price, orders] : bids_)
             bidInfos.push_back(createLevelInfo(price, orders));
 
-        for (const auto& [price, orders] : asks_)
+        for (const auto &[price, orders] : asks_)
             askInfos.push_back(createLevelInfo(price, orders));
 
-        return OrderbookLevelInfos{ bidInfos, askInfos };
+        return OrderbookLevelInfos{bidInfos, askInfos};
     }
 };
 
@@ -615,19 +608,22 @@ struct HttpRequest
     std::string method;
     std::string target;
     std::string path;
+    std::string http_version;
     std::unordered_map<std::string, std::string> headers;
     std::string body;
 };
 
 static std::string to_lower(std::string value)
 {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c)
+                   { return static_cast<char>(std::tolower(c)); });
     return value;
 }
 
 static std::string trim(std::string value)
 {
-    auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
+    auto is_space = [](unsigned char c)
+    { return std::isspace(c) != 0; };
     while (!value.empty() && is_space(value.front()))
         value.erase(value.begin());
     while (!value.empty() && is_space(value.back()))
@@ -635,7 +631,7 @@ static std::string trim(std::string value)
     return value;
 }
 
-static bool send_all(int fd, const std::string& data)
+static bool send_all(int fd, const std::string &data)
 {
     std::size_t sent = 0;
     while (sent < data.size())
@@ -648,7 +644,7 @@ static bool send_all(int fd, const std::string& data)
     return true;
 }
 
-static bool recv_into_buffer(int fd, std::string& buffer)
+static bool recv_into_buffer(int fd, std::string &buffer)
 {
     char temp[4096];
     const auto n = ::recv(fd, temp, sizeof(temp), 0);
@@ -689,6 +685,7 @@ static std::optional<HttpRequest> read_http_request(int fd)
     request_line_stream >> request.method >> request.target >> http_version;
     if (request.method.empty() || request.target.empty())
         return std::nullopt;
+    request.http_version = http_version;
 
     std::string header_line;
     while (std::getline(header_stream, header_line))
@@ -725,6 +722,20 @@ static std::optional<HttpRequest> read_http_request(int fd)
     return request;
 }
 
+static bool request_keep_alive(const HttpRequest &request)
+{
+    const auto it = request.headers.find("connection");
+    if (it != request.headers.end())
+    {
+        const auto value = to_lower(it->second);
+        if (value == "close")
+            return false;
+        if (value == "keep-alive")
+            return true;
+    }
+    return request.http_version != "HTTP/1.0";
+}
+
 static std::string json_escape(std::string value)
 {
     std::string out;
@@ -733,13 +744,27 @@ static std::string json_escape(std::string value)
     {
         switch (c)
         {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\b': out += "\\b"; break;
-        case '\f': out += "\\f"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '"':
+            out += "\\\"";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
         default:
             out.push_back(c);
             break;
@@ -748,7 +773,7 @@ static std::string json_escape(std::string value)
     return out;
 }
 
-static std::optional<std::string> extract_json_string(const std::string& body, const std::string& key)
+static std::optional<std::string> extract_json_string(const std::string &body, const std::string &key)
 {
     const auto key_pos = body.find('"' + key + '"');
     if (key_pos == std::string::npos)
@@ -769,7 +794,7 @@ static std::optional<std::string> extract_json_string(const std::string& body, c
     return body.substr(first_quote + 1, second_quote - first_quote - 1);
 }
 
-static std::optional<long long> extract_json_integer(const std::string& body, const std::string& key)
+static std::optional<long long> extract_json_integer(const std::string &body, const std::string &key)
 {
     const auto key_pos = body.find('"' + key + '"');
     if (key_pos == std::string::npos)
@@ -794,12 +819,37 @@ static std::optional<long long> extract_json_integer(const std::string& body, co
     }
 }
 
+static std::optional<double> extract_json_number(const std::string &body, const std::string &key)
+{
+    const auto key_pos = body.find('"' + key + '"');
+    if (key_pos == std::string::npos)
+        return std::nullopt;
+
+    const auto colon = body.find(':', key_pos);
+    if (colon == std::string::npos)
+        return std::nullopt;
+
+    auto start = body.find_first_of("-0123456789", colon + 1);
+    if (start == std::string::npos)
+        return std::nullopt;
+
+    auto end = body.find_first_not_of("-0123456789.", start);
+    try
+    {
+        return std::stod(body.substr(start, end - start));
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
 static std::string side_to_string(Side side)
 {
     return side == Side::Buy ? "buy" : "sell";
 }
 
-static std::optional<Side> parse_side(const std::string& value)
+static std::optional<Side> parse_side(const std::string &value)
 {
     const auto lower = to_lower(value);
     if (lower == "buy")
@@ -809,7 +859,35 @@ static std::optional<Side> parse_side(const std::string& value)
     return std::nullopt;
 }
 
-static std::vector<std::string> split_path(const std::string& path)
+static std::string normalize_type(std::string value)
+{
+    value = to_lower(value);
+    value.erase(std::remove_if(value.begin(), value.end(),
+                               [](unsigned char c)
+                               {
+                                   return c == '_' || c == '-' || std::isspace(c);
+                               }),
+                value.end());
+    return value;
+}
+
+static std::optional<OrderType> parse_order_type(const std::string &value)
+{
+    const auto v = normalize_type(value);
+    if (v == "limit" || v == "gtc" || v == "goodtillcancel")
+        return OrderType::GoodTillCancel;
+    if (v == "gfd" || v == "goodforday")
+        return OrderType::GoodForDay;
+    if (v == "fok" || v == "fillorkill")
+        return OrderType::FillOrKill;
+    if (v == "fak" || v == "fillandkill" || v == "ioc" || v == "immediateorcancel")
+        return OrderType::FillAndKill;
+    if (v == "market")
+        return OrderType::Market;
+    return std::nullopt;
+}
+
+static std::vector<std::string> split_path(const std::string &path)
 {
     std::vector<std::string> parts;
     std::istringstream stream(path);
@@ -822,20 +900,20 @@ static std::vector<std::string> split_path(const std::string& path)
     return parts;
 }
 
-static std::string build_http_response(int code, const std::string& status, const std::string& body, const std::string& content_type = "application/json")
+static std::string build_http_response(int code, const std::string &status, const std::string &body, const std::string &content_type = "application/json", bool keep_alive = false)
 {
     std::ostringstream response;
     response << "HTTP/1.1 " << code << ' ' << status << "\r\n";
     response << "Content-Type: " << content_type << "\r\n";
     response << "Content-Length: " << body.size() << "\r\n";
-    response << "Connection: close\r\n\r\n";
+    response << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n\r\n";
     response << body;
     return response.str();
 }
 
-static std::string make_book_json(const std::string& ticker, const OrderbookLevelInfos& infos)
+static std::string make_book_json(const std::string &ticker, const OrderbookLevelInfos &infos)
 {
-    auto serialize_levels = [](const LevelInfos& levels)
+    auto serialize_levels = [](const LevelInfos &levels)
     {
         std::ostringstream out;
         out << '[';
@@ -852,13 +930,13 @@ static std::string make_book_json(const std::string& ticker, const OrderbookLeve
     std::ostringstream out;
     out << '{'
         << "\"ticker\":\"" << json_escape(ticker) << "\",";
-    out << "\"bids\":" << serialize_levels(LevelInfos{ infos.GetBids().begin(), infos.GetBids().begin() + std::min<std::size_t>(10, infos.GetBids().size()) }) << ',';
-    out << "\"asks\":" << serialize_levels(LevelInfos{ infos.GetAsks().begin(), infos.GetAsks().begin() + std::min<std::size_t>(10, infos.GetAsks().size()) })
+    out << "\"bids\":" << serialize_levels(LevelInfos{infos.GetBids().begin(), infos.GetBids().begin() + std::min<std::size_t>(10, infos.GetBids().size())}) << ',';
+    out << "\"asks\":" << serialize_levels(LevelInfos{infos.GetAsks().begin(), infos.GetAsks().begin() + std::min<std::size_t>(10, infos.GetAsks().size())})
         << '}';
     return out.str();
 }
 
-static std::string make_trades_json(const Trades& trades, const std::string& ticker)
+static std::string make_trades_json(const Trades &trades, const std::string &ticker)
 {
     std::ostringstream out;
     out << '{' << "\"ticker\":\"" << json_escape(ticker) << "\"," << "\"trades\":";
@@ -867,7 +945,7 @@ static std::string make_trades_json(const Trades& trades, const std::string& tic
     {
         if (i > 0)
             out << ',';
-        const auto& trade = trades[i];
+        const auto &trade = trades[i];
         out << '{'
             << "\"buy_order_id\":" << trade.GetBidTrade().orderId_ << ','
             << "\"sell_order_id\":" << trade.GetAskTrade().orderId_ << ','
@@ -879,7 +957,7 @@ static std::string make_trades_json(const Trades& trades, const std::string& tic
     return out.str();
 }
 
-static std::string make_fill_event_json(const Trades& trades, const std::string& ticker)
+static std::string make_fill_event_json(const Trades &trades, const std::string &ticker)
 {
     std::ostringstream out;
     out << '{' << "\"type\":\"FILL\"," << "\"ticker\":\"" << json_escape(ticker) << "\"," << "\"trades\":";
@@ -888,7 +966,7 @@ static std::string make_fill_event_json(const Trades& trades, const std::string&
     {
         if (i > 0)
             out << ',';
-        const auto& trade = trades[i];
+        const auto &trade = trades[i];
         out << '{'
             << "\"buy_order_id\":" << trade.GetBidTrade().orderId_ << ','
             << "\"sell_order_id\":" << trade.GetAskTrade().orderId_ << ','
@@ -903,7 +981,7 @@ static std::string make_fill_event_json(const Trades& trades, const std::string&
 class Sha1
 {
 public:
-    void update(const std::string& input)
+    void update(const std::string &input)
     {
         for (unsigned char c : input)
         {
@@ -950,7 +1028,7 @@ public:
     }
 
 private:
-    void transform(const std::uint8_t* data)
+    void transform(const std::uint8_t *data)
     {
         std::uint32_t w[80];
         for (int i = 0; i < 16; ++i)
@@ -1015,18 +1093,17 @@ private:
     }
 
     std::array<std::uint8_t, 64> buffer_{};
-    std::size_t bufferSize_{ 0 };
-    std::uint64_t bitLength_{ 0 };
+    std::size_t bufferSize_{0};
+    std::uint64_t bitLength_{0};
     std::array<std::uint32_t, 5> state_{
         0x67452301,
         0xefcdab89,
         0x98badcfe,
         0x10325476,
-        0xc3d2e1f0
-    };
+        0xc3d2e1f0};
 };
 
-static std::string base64_encode(const std::array<std::uint8_t, 20>& data)
+static std::string base64_encode(const std::array<std::uint8_t, 20> &data)
 {
     static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string out;
@@ -1051,14 +1128,14 @@ static std::string base64_encode(const std::array<std::uint8_t, 20>& data)
     return out;
 }
 
-static std::string websocket_accept_key(const std::string& client_key)
+static std::string websocket_accept_key(const std::string &client_key)
 {
     Sha1 sha1;
     sha1.update(client_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     return base64_encode(sha1.final());
 }
 
-static std::vector<std::uint8_t> websocket_text_frame(const std::string& payload)
+static std::vector<std::uint8_t> websocket_text_frame(const std::string &payload)
 {
     std::vector<std::uint8_t> frame;
     frame.reserve(payload.size() + 10);
@@ -1090,23 +1167,23 @@ class WebSocketHub
 public:
     void add_client(int fd)
     {
-        std::scoped_lock lock{ mutex_ };
+        std::scoped_lock lock{mutex_};
         clients_.push_back(fd);
     }
 
     void remove_client(int fd)
     {
-        std::scoped_lock lock{ mutex_ };
+        std::scoped_lock lock{mutex_};
         clients_.erase(std::remove(clients_.begin(), clients_.end(), fd), clients_.end());
     }
 
-    void broadcast(const std::string& payload)
+    void broadcast(const std::string &payload)
     {
         const auto frame = websocket_text_frame(payload);
 
         std::vector<int> snapshot;
         {
-            std::scoped_lock lock{ mutex_ };
+            std::scoped_lock lock{mutex_};
             snapshot = clients_;
         }
 
@@ -1119,16 +1196,15 @@ public:
 
         if (!failed.empty())
         {
-            std::scoped_lock lock{ mutex_ };
+            std::scoped_lock lock{mutex_};
             clients_.erase(std::remove_if(clients_.begin(), clients_.end(), [&](int fd)
-            {
-                return std::find(failed.begin(), failed.end(), fd) != failed.end();
-            }), clients_.end());
+                                          { return std::find(failed.begin(), failed.end(), fd) != failed.end(); }),
+                           clients_.end());
         }
     }
 
 private:
-    static bool send_frame(int fd, const std::vector<std::uint8_t>& frame)
+    static bool send_frame(int fd, const std::vector<std::uint8_t> &frame)
     {
         std::size_t sent = 0;
         while (sent < frame.size())
@@ -1220,7 +1296,7 @@ public:
         address.sin_addr.s_addr = INADDR_ANY;
         address.sin_port = htons(port);
 
-        if (::bind(server_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0)
+        if (::bind(server_fd_, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0)
             throw std::runtime_error("failed to bind socket");
 
         if (::listen(server_fd_, 64) < 0)
@@ -1232,7 +1308,7 @@ public:
         {
             sockaddr_in client_addr{};
             socklen_t client_len = sizeof(client_addr);
-            const int client_fd = ::accept(server_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+            const int client_fd = ::accept(server_fd_, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
             if (client_fd < 0)
                 continue;
 
@@ -1249,22 +1325,25 @@ public:
 private:
     struct OrderRequest
     {
+        bool is_cancel = false;
+        OrderId cancel_id = 0;
         std::string ticker;
         Side side;
-        Price price;
-        Quantity qty;
+        Price price = Constants::InvalidPrice;
+        Quantity qty = 0;
+        OrderType type = OrderType::GoodTillCancel;
     };
 
-    std::shared_ptr<Orderbook> get_book(const std::string& ticker)
+    std::shared_ptr<Orderbook> get_book(const std::string &ticker)
     {
-        std::scoped_lock lock{ registry_mutex_ };
-        auto& book = books_[ticker];
+        std::scoped_lock lock{registry_mutex_};
+        auto &book = books_[ticker];
         if (!book)
             book = std::make_shared<Orderbook>();
         return book;
     }
 
-    static std::vector<std::string> split_levels(const LevelInfos& infos, std::size_t max_levels)
+    static std::vector<std::string> split_levels(const LevelInfos &infos, std::size_t max_levels)
     {
         std::vector<std::string> out;
         const auto limit = std::min(max_levels, infos.size());
@@ -1278,7 +1357,7 @@ private:
         return out;
     }
 
-    std::string serialize_book(const std::string& ticker)
+    std::string serialize_book(const std::string &ticker)
     {
         auto book = get_book(ticker);
         auto infos = book->GetOrderInfos();
@@ -1308,31 +1387,98 @@ private:
         return out.str();
     }
 
-    std::optional<OrderRequest> parse_order_request(const std::string& body)
+    std::optional<OrderRequest> parse_order_request(const std::string &body)
     {
+        auto type_text = extract_json_string(body, "type");
+        if (!type_text)
+            type_text = extract_json_string(body, "order_type");
+        if (!type_text)
+            type_text = extract_json_string(body, "orderType");
+
+        const auto normalized = normalize_type(type_text.value_or("limit"));
+        if (normalized == "cancel")
+        {
+            auto order_id = extract_json_integer(body, "order_id");
+            if (!order_id)
+                order_id = extract_json_integer(body, "id");
+            if (!order_id)
+                order_id = extract_json_integer(body, "orderId");
+            if (!order_id)
+                return std::nullopt;
+
+            OrderRequest req;
+            req.is_cancel = true;
+            req.cancel_id = static_cast<OrderId>(*order_id);
+            return req;
+        }
+
+        auto order_type = parse_order_type(type_text.value_or("limit"));
+        if (!order_type)
+            return std::nullopt;
+
         auto ticker = extract_json_string(body, "ticker");
         auto side_text = extract_json_string(body, "side");
-        auto price = extract_json_integer(body, "price");
         auto qty = extract_json_integer(body, "qty");
+        if (!qty)
+            qty = extract_json_integer(body, "quantity");
 
-        if (!ticker || !side_text || !price || !qty)
+        if (!ticker || !side_text || !qty)
             return std::nullopt;
 
         auto side = parse_side(*side_text);
         if (!side)
             return std::nullopt;
 
-        return OrderRequest{ *ticker, *side, static_cast<Price>(*price), static_cast<Quantity>(*qty) };
+        Price price_value = Constants::InvalidPrice;
+        if (*order_type != OrderType::Market)
+        {
+            auto price = extract_json_number(body, "price");
+            if (!price)
+                return std::nullopt;
+            price_value = static_cast<Price>(std::llround(*price));
+        }
+
+        OrderRequest req;
+        req.ticker = *ticker;
+        req.side = *side;
+        req.qty = static_cast<Quantity>(*qty);
+        req.price = price_value;
+        req.type = *order_type;
+        return req;
     }
 
-    void cleanup_filled_orders(const std::string& ticker, OrderId new_order_id, const Trades& trades, const std::shared_ptr<Orderbook>& book)
+    std::string cancel_order_by_id(OrderId order_id, bool keep_alive)
     {
-        std::scoped_lock lock{ registry_mutex_ };
+        std::string ticker;
+        {
+            std::scoped_lock lock{registry_mutex_};
+            auto it = order_to_ticker_.find(order_id);
+            if (it == order_to_ticker_.end())
+                return build_http_response(404, "Not Found", "{\"error\":\"order not found\"}", "application/json", keep_alive);
+            ticker = it->second;
+        }
+
+        auto book = get_book(ticker);
+        book->CancelOrder(order_id);
+
+        {
+            std::scoped_lock lock{registry_mutex_};
+            order_to_ticker_.erase(order_id);
+        }
+
+        std::ostringstream body;
+        body << '{' << "\"order_id\":" << order_id << ',' << "\"status\":\"cancelled\"}";
+        return build_http_response(200, "OK", body.str(), "application/json", keep_alive);
+    }
+
+    void cleanup_filled_orders(const std::string &ticker, OrderId new_order_id, const Trades &trades, const std::shared_ptr<Orderbook> &book)
+    {
+        std::scoped_lock lock{registry_mutex_};
 
         if (!book->HasOrder(new_order_id))
             order_to_ticker_.erase(new_order_id);
 
-        for (const auto& trade : trades)
+        for (const auto &trade : trades)
         {
             if (!book->HasOrder(trade.GetBidTrade().orderId_))
                 order_to_ticker_.erase(trade.GetBidTrade().orderId_);
@@ -1343,19 +1489,26 @@ private:
         (void)ticker;
     }
 
-    std::string handle_order(const HttpRequest& request)
+    std::string handle_order(const HttpRequest &request, bool keep_alive)
     {
         auto parsed = parse_order_request(request.body);
         if (!parsed)
-            return build_http_response(400, "Bad Request", "{\"error\":\"invalid order payload\"}");
+            return build_http_response(400, "Bad Request", "{\"error\":\"invalid order payload\"}", "application/json", keep_alive);
+
+        if (parsed->is_cancel)
+            return cancel_order_by_id(parsed->cancel_id, keep_alive);
 
         const OrderId order_id = next_order_id_.fetch_add(1, std::memory_order_relaxed);
         auto book = get_book(parsed->ticker);
-        auto order = std::make_shared<Order>(OrderType::GoodTillCancel, order_id, parsed->side, parsed->price, parsed->qty);
+        std::shared_ptr<Order> order;
+        if (parsed->type == OrderType::Market)
+            order = std::make_shared<Order>(order_id, parsed->side, parsed->qty);
+        else
+            order = std::make_shared<Order>(parsed->type, order_id, parsed->side, parsed->price, parsed->qty);
         auto trades = book->AddOrder(order);
 
         {
-            std::scoped_lock lock{ registry_mutex_ };
+            std::scoped_lock lock{registry_mutex_};
             order_to_ticker_[order_id] = parsed->ticker;
         }
 
@@ -1371,7 +1524,7 @@ private:
         {
             if (i > 0)
                 body << ',';
-            const auto& trade = trades[i];
+            const auto &trade = trades[i];
             body << '{'
                  << "\"buy_order_id\":" << trade.GetBidTrade().orderId_ << ','
                  << "\"sell_order_id\":" << trade.GetAskTrade().orderId_ << ','
@@ -1381,56 +1534,37 @@ private:
         }
         body << "]}";
 
-        return build_http_response(200, "OK", body.str());
+        return build_http_response(200, "OK", body.str(), "application/json", keep_alive);
     }
 
-    std::string handle_cancel(const std::string& path)
+    std::string handle_cancel(const std::string &path, bool keep_alive)
     {
         const auto parts = split_path(path);
         if (parts.size() != 2)
-            return build_http_response(404, "Not Found", "{\"error\":\"unknown order route\"}");
+            return build_http_response(404, "Not Found", "{\"error\":\"unknown order route\"}", "application/json", keep_alive);
 
         try
         {
             const auto order_id = static_cast<OrderId>(std::stoull(parts[1]));
-            std::string ticker;
-            {
-                std::scoped_lock lock{ registry_mutex_ };
-                auto it = order_to_ticker_.find(order_id);
-                if (it == order_to_ticker_.end())
-                    return build_http_response(404, "Not Found", "{\"error\":\"order not found\"}");
-                ticker = it->second;
-            }
-
-            auto book = get_book(ticker);
-            book->CancelOrder(order_id);
-
-            {
-                std::scoped_lock lock{ registry_mutex_ };
-                order_to_ticker_.erase(order_id);
-            }
-
-            std::ostringstream body;
-            body << '{' << "\"order_id\":" << order_id << ',' << "\"status\":\"cancelled\"}";
-            return build_http_response(200, "OK", body.str());
+            return cancel_order_by_id(order_id, keep_alive);
         }
         catch (...)
         {
-            return build_http_response(400, "Bad Request", "{\"error\":\"invalid order id\"}");
+            return build_http_response(400, "Bad Request", "{\"error\":\"invalid order id\"}", "application/json", keep_alive);
         }
     }
 
-    std::string handle_get_book(const std::string& path)
+    std::string handle_get_book(const std::string &path, bool keep_alive)
     {
         const auto parts = split_path(path);
         if (parts.size() != 2)
-            return build_http_response(404, "Not Found", "{\"error\":\"unknown book route\"}");
+            return build_http_response(404, "Not Found", "{\"error\":\"unknown book route\"}", "application/json", keep_alive);
 
         auto body = serialize_book(parts[1]);
-        return build_http_response(200, "OK", body);
+        return build_http_response(200, "OK", body, "application/json", keep_alive);
     }
 
-    static std::string extract_websocket_key(const HttpRequest& request)
+    static std::string extract_websocket_key(const HttpRequest &request)
     {
         auto it = request.headers.find("sec-websocket-key");
         if (it == request.headers.end())
@@ -1438,7 +1572,7 @@ private:
         return it->second;
     }
 
-    void handle_websocket(int client_fd, const HttpRequest& request)
+    void handle_websocket(int client_fd, const HttpRequest &request)
     {
         const auto key = extract_websocket_key(request);
         if (key.empty())
@@ -1460,61 +1594,64 @@ private:
 
         ws_hub_.add_client(client_fd);
         std::thread([this, client_fd]
-        {
+                    {
             consume_websocket_frames(client_fd);
             ws_hub_.remove_client(client_fd);
-            ::close(client_fd);
-        }).detach();
+            ::close(client_fd); })
+            .detach();
     }
 
     void handle_connection(int client_fd)
     {
-        auto request = read_http_request(client_fd);
-        if (!request)
+        while (true)
         {
-            ::close(client_fd);
-            return;
+            auto request = read_http_request(client_fd);
+            if (!request)
+                break;
+
+            const auto upgrade_it = request->headers.find("upgrade");
+            if (request->path == "/stream" && upgrade_it != request->headers.end() && to_lower(upgrade_it->second) == "websocket")
+            {
+                handle_websocket(client_fd, *request);
+                return;
+            }
+
+            const bool keep_alive = request_keep_alive(*request);
+            std::string response;
+            if (request->method == "POST" && request->path == "/order")
+            {
+                response = handle_order(*request, keep_alive);
+            }
+            else if (request->method == "DELETE" && request->path.rfind("/order/", 0) == 0)
+            {
+                response = handle_cancel(request->path, keep_alive);
+            }
+            else if (request->method == "GET" && request->path.rfind("/book/", 0) == 0)
+            {
+                response = handle_get_book(request->path, keep_alive);
+            }
+            else if (request->method == "GET" && request->path == "/health")
+            {
+                response = build_http_response(200, "OK", "{\"status\":\"ok\"}", "application/json", keep_alive);
+            }
+            else
+            {
+                response = build_http_response(404, "Not Found", "{\"error\":\"unknown route\"}", "application/json", keep_alive);
+            }
+
+            if (!send_all(client_fd, response) || !keep_alive)
+                break;
         }
 
-        const auto upgrade_it = request->headers.find("upgrade");
-        if (request->path == "/stream" && upgrade_it != request->headers.end() && to_lower(upgrade_it->second) == "websocket")
-        {
-            handle_websocket(client_fd, *request);
-            return;
-        }
-
-        std::string response;
-        if (request->method == "POST" && request->path == "/order")
-        {
-            response = handle_order(*request);
-        }
-        else if (request->method == "DELETE" && request->path.rfind("/order/", 0) == 0)
-        {
-            response = handle_cancel(request->path);
-        }
-        else if (request->method == "GET" && request->path.rfind("/book/", 0) == 0)
-        {
-            response = handle_get_book(request->path);
-        }
-        else if (request->method == "GET" && request->path == "/health")
-        {
-            response = build_http_response(200, "OK", "{\"status\":\"ok\"}");
-        }
-        else
-        {
-            response = build_http_response(404, "Not Found", "{\"error\":\"unknown route\"}");
-        }
-
-        send_all(client_fd, response);
         ::close(client_fd);
     }
 
-    int server_fd_{ -1 };
+    int server_fd_{-1};
     std::unordered_map<std::string, std::shared_ptr<Orderbook>> books_;
     std::unordered_map<OrderId, std::string> order_to_ticker_;
     std::mutex registry_mutex_;
     WebSocketHub ws_hub_;
-    std::atomic<OrderId> next_order_id_{ 1 };
+    std::atomic<OrderId> next_order_id_{1};
 };
 
 int main()
@@ -1522,9 +1659,9 @@ int main()
     try
     {
         ExchangeServer server;
-        server.run(8080);
+        server.run(9999);
     }
-    catch (const std::exception& ex)
+    catch (const std::exception &ex)
     {
         std::cerr << "server failed: " << ex.what() << std::endl;
         return 1;

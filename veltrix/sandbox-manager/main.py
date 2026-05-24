@@ -1,5 +1,6 @@
 # sandbox-manager/main.py
 import os, time, uuid, tarfile, tempfile, docker, redis, asyncpg, asyncio, boto3, socket, zipfile, shutil, stat
+import httpx
 from pathlib import PurePosixPath
 from docker.errors import NotFound, APIError
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -31,9 +32,6 @@ class Settings(BaseSettings):
     default_num_bots: int = 100
     default_duration_secs: int = 60
 
-    class Config:
-        env_file = ".env"
-
 cfg = Settings()
 
 docker_client = docker.from_env()
@@ -58,6 +56,50 @@ async def update_submission(db, submission_id, **fields):
         f"UPDATE submissions SET {set_clause}, updated_at = NOW() WHERE id = $1",
         submission_id, *values
     )
+
+async def cleanup_sandbox_after_run(submission_id: str,
+                                   container_id: str,
+                                   image_tag: str | None,
+                                   delay_secs: int) -> None:
+    await asyncio.sleep(delay_secs)
+
+    try:
+        container = docker_client.containers.get(container_id)
+    except NotFound:
+        return
+
+    try:
+        exit_code = get_container_exit_code(container)
+        if exit_code is None:
+            container.stop(timeout=5)
+    except APIError as e:
+        print(f"[WARN] Failed to stop container {container_id}: {e}")
+
+    try:
+        container.remove(force=True)
+        print(f"[INFO] Cleaned up sandbox container {container_id}")
+    except APIError as e:
+        print(f"[WARN] Failed to remove container {container_id}: {e}")
+
+    if image_tag:
+        try:
+            docker_client.images.remove(image=image_tag, force=True)
+        except APIError as e:
+            print(f"[WARN] Failed to remove image {image_tag}: {e}")
+
+    try:
+        db = await get_db()
+        row = await db.fetchrow(
+            "SELECT status FROM submissions WHERE id = $1",
+            submission_id
+        )
+        if row and row["status"] == "RUNNING":
+            await update_submission(db, submission_id, status="SUCCESS")
+    finally:
+        try:
+            await db.close()
+        except Exception:
+            pass
 
 def _is_unsafe_path(path: str) -> bool:
     if os.path.isabs(path):
@@ -461,13 +503,23 @@ async def process_submission(submission_id: str):
 
         await trigger_fleet_commander(
             submission_id = submission_id,
-            host          = "localhost",
-            port          = str(host_port),
+            host          = f"sandbox-{submission_id}",
+            port          = "9999",
             num_bots      = cfg.default_num_bots,
             duration_secs = cfg.default_duration_secs
         )
 
         await update_submission(db, submission_id, status="RUNNING")
+
+        cleanup_delay = cfg.default_duration_secs + 10
+        asyncio.create_task(
+            cleanup_sandbox_after_run(
+                submission_id,
+                container_id,
+                image_tag,
+                cleanup_delay
+            )
+        )
 
     except Exception as e:
         # Catch-all for anything unexpected — platform fault, not contestant fault

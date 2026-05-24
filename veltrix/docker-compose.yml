@@ -25,6 +25,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./db/leaderboard_metrics.sql:/docker-entrypoint-initdb.d/02_metrics.sql
     ports:
       - "5432:5432"
     networks: [backend]
@@ -156,7 +157,7 @@ services:
       TELEMETRY_INGESTER_PORT: 8090
     ports:
       - "7070:7070"   # FleetCommander HTTP trigger endpoint
-    networks: [backend]
+    networks: [backend, sandbox-net]
     depends_on:
       telemetry-ingester: { condition: service_healthy }
     # io_uring requires these kernel capabilities
@@ -171,3 +172,25 @@ services:
       nofile:
         soft: 65536             # Allows the bots to open 65,000 concurrent sockets
         hard: 65536   # allow 65k open file descriptors (one per bot socket)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  artifact-checker:
+    build: ./artifact-checker
+    restart: always
+    environment:
+      REDPANDA_BROKERS:  redpanda:9092
+      METRICS_TOPIC:     order_metrics
+      CONSUMER_GROUP:    artifact-checker
+      POSTGRES_HOST:     postgres
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SANDBOX_HOST:      ${ARTIFACT_SANDBOX_HOST:-sandbox-manager}   # set to sandbox-<submission_id>
+      SANDBOX_PORT:      ${ARTIFACT_SANDBOX_PORT:-9999}
+    cpuset: "7"                            # pin to CPU core 7 (hardware isolation)
+    networks: [backend, sandbox-net]
+    depends_on:
+      redpanda:  { condition: service_healthy }
+      postgres:  { condition: service_healthy }

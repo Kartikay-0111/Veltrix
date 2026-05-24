@@ -10,13 +10,13 @@ CREATE TABLE teams (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- PENDING | BUILDING | READY | FAILED_LOGIC | FAILED_RESOURCE | FAILED_STARTUP | FAILED_SYSTEM
+-- PENDING | BUILDING | READY | RUNNING | SUCCESS | FAILED_LOGIC | FAILED_RESOURCE | FAILED_STARTUP | FAILED_SYSTEM
 CREATE TABLE submissions (
     id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     team_id       UUID REFERENCES teams(id) ON DELETE CASCADE,
     language      TEXT NOT NULL,        
     status        TEXT NOT NULL DEFAULT 'PENDING' 
-                  CHECK (status IN ('PENDING', 'BUILDING', 'READY', 'SUCCESS', 'FAILED_LOGIC', 'FAILED_RESOURCE', 'FAILED_STARTUP', 'FAILED_SYSTEM')),
+                  CHECK (status IN ('PENDING', 'BUILDING', 'READY', 'RUNNING', 'SUCCESS', 'FAILED_LOGIC', 'FAILED_RESOURCE', 'FAILED_STARTUP', 'FAILED_SYSTEM')),
     storage_key   TEXT,                 
     container_id  TEXT,                 
     endpoint_url  TEXT,                 

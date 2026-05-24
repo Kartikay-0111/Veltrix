@@ -39,7 +39,6 @@ last_metric: dict[str, Any] | None = None
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
-
 @app.post("/metrics")
 def ingest_metrics(metric: MetricEnvelope) -> dict[str, str]:
     global last_metric

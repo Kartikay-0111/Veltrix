@@ -41,7 +41,7 @@ private:
     std::uniform_int_distribution<int> ticker_dist_; // which symbol
     std::uniform_int_distribution<int> type_dist_;   // which order type
 
-    std::string make_limit_order();
+    std::string make_limit_order(const char *type = "LIMIT");
     std::string make_market_order();
     std::string make_cancel_order();
 };
