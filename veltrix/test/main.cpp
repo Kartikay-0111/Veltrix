@@ -670,6 +670,7 @@ static std::optional<HttpRequest> read_http_request(int fd)
     const auto header_end = buffer.find("\r\n\r\n");
     const auto header_text = buffer.substr(0, header_end);
     auto body = buffer.substr(header_end + 4);
+    buffer.clear();
 
     std::istringstream header_stream(header_text);
     std::string request_line;
@@ -708,10 +709,8 @@ static std::optional<HttpRequest> read_http_request(int fd)
         const auto content_length = static_cast<std::size_t>(std::stoul(content_length_it->second));
         while (body.size() < content_length)
         {
-            if (!recv_into_buffer(fd, buffer))
+            if (!recv_into_buffer(fd, body))
                 return std::nullopt;
-            body.append(buffer);
-            buffer.clear();
         }
         body.resize(content_length);
     }

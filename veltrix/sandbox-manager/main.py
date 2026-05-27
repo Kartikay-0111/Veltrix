@@ -50,6 +50,7 @@ async def get_db():
     )
 
 async def update_submission(db, submission_id, **fields):
+    """Update the submissions table with the given fields."""
     set_clause = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(fields))
     values = list(fields.values())
     await db.execute(
@@ -61,6 +62,7 @@ async def cleanup_sandbox_after_run(submission_id: str,
                                    container_id: str,
                                    image_tag: str | None,
                                    delay_secs: int) -> None:
+    """Wait for the benchmark to finish, then stop and remove the container and image."""
     await asyncio.sleep(delay_secs)
 
     try:
@@ -191,39 +193,45 @@ def extract_archive(archive_path: str, dest_dir: str, max_total: int, max_file: 
 
 def render_dockerfile(language: str) -> str:
     if language == "cpp":
-        packages = "g++ cmake make libboost-all-dev curl ca-certificates"
-        build_cmds = r"""
-RUN if [ -f CMakeLists.txt ]; then cmake -S . -B build && cmake --build build; fi \
-    && if [ -f build/server ]; then cp build/server /app/server; fi \
-    && if [ -f Makefile ] && [ ! -f /app/server ]; then make; fi \
-    && if [ -f server ] && [ ! -f /app/server ]; then cp server /app/server; fi \
-    && if [ ! -f /app/server ] && ls *.cpp >/dev/null 2>&1; then g++ -O2 -o /app/server *.cpp; fi \
-    && if [ ! -f /app/server ]; then echo "Build failed: server binary not found" >&2; exit 1; fi
-"""
-    elif language == "rust":
-        packages = "rustc cargo ca-certificates"
-        build_cmds = r"""
-RUN cargo build --release \
-    && if [ -f target/release/server ]; then cp target/release/server /app/server; else echo "Build failed: target/release/server not found" >&2; exit 1; fi
-"""
-    elif language == "go":
-        packages = "golang-go ca-certificates"
-        build_cmds = r"""
-RUN go build -o /app/server .
-"""
-    else:
-        raise ValueError(f"Unsupported language: {language}")
+        return """FROM ubuntu:22.04
+            ENV DEBIAN_FRONTEND=noninteractive
+            RUN apt-get update && apt-get install -y --no-install-recommends \
+                g++ cmake make libboost-all-dev \
+                && rm -rf /var/lib/apt/lists/*
+            WORKDIR /app
+            COPY . /app/
+            RUN cmake -S . -B build --parallel $(nproc) \
+                && cmake --build build \
+                && test -f build/server \
+                || (echo "ERROR: CMake build must produce a binary named 'server'" >&2 && exit 1)
+            EXPOSE 9999
+            CMD ["./build/server"]
+            """
 
-    return f"""FROM ubuntu:22.04
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends {packages} \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY src/ /app/
-{build_cmds}
-EXPOSE 9999
-CMD ["/app/server"]
-"""
+    elif language == "rust":
+        return """FROM rust:1.78-slim
+            WORKDIR /app
+            COPY . /app/
+            RUN cargo build --release \
+                && test -f target/release/server \
+                || (echo "ERROR: Cargo build must produce a binary named 'server'" >&2 && exit 1)
+            EXPOSE 9999
+            CMD ["./target/release/server"]
+            """
+
+    elif language == "go":
+        return """FROM golang:1.22-bookworm
+            WORKDIR /app
+            COPY . /app/
+            RUN go build -o server . \
+                && test -f server \
+                || (echo "ERROR: Go build must produce a binary named 'server'" >&2 && exit 1)
+            EXPOSE 9999
+            CMD ["./server"]
+            """
+
+    else:
+        raise ValueError(f"Unsupported language: {language}. Must be cpp, rust, or go.")
 
 def build_sandbox_image(submission_id: str, storage_key: str, language: str) -> str:
     """Download code from MinIO, build a Docker image, return image tag."""
@@ -253,10 +261,10 @@ def build_sandbox_image(submission_id: str, storage_key: str, language: str) -> 
 
     return image_tag
 
-def run_sandbox(image_tag: str, submission_id: str) -> tuple[str, str, int]:
+def run_sandbox(image_tag: str, submission_id: str) -> tuple[str, str, str, int]:
     """
     Run the container with strict resource limits.
-    Returns (container_id, endpoint_url, host_port)
+    Returns (container_id, endpoint_url, target_host, target_port)
     """
     container_name = f"sandbox-{submission_id}"
     try:
@@ -281,19 +289,32 @@ def run_sandbox(image_tag: str, submission_id: str) -> tuple[str, str, int]:
 
         # ── Resource limits ──────────────────────────────────────
         pids_limit=100,             # max 100 processes
-        ports={"9999/tcp": None},   # random host port assigned by Docker
+        # ports={"9999/tcp": None},   # random host port assigned by Docker
     )
 
-    # Wait for container to start and get assigned port
+    # Wait for container to start and capture its sandbox-net IP
     time.sleep(2)
     container.reload()
-    port_info = container.ports.get("9999/tcp")
-    if not port_info:
-        raise RuntimeError("Port mapping not assigned")
-    host_port = int(port_info[0]["HostPort"])
-    endpoint_url = f"http://{cfg.sandbox_host}:{host_port}"
 
-    return container.id, endpoint_url, host_port
+    target_port = 9999
+    endpoint_url = f"http://{container_name}:{target_port}"
+
+    sandbox_ip = ""
+    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+    if cfg.sandbox_network in networks:
+        sandbox_ip = networks[cfg.sandbox_network].get("IPAddress", "")
+
+    target_host = sandbox_ip if sandbox_ip else container_name
+
+    return container.id, endpoint_url, target_host, target_port
+    # container.reload()
+    # port_info = container.ports.get("9999/tcp")
+    # if not port_info:
+    #     raise RuntimeError("Port mapping not assigned")
+    # host_port = int(port_info[0]["HostPort"])
+    # endpoint_url = f"http://{cfg.sandbox_host}:{host_port}"
+
+    # return container.id, endpoint_url, host_port
 
 # ── Constants ─────────────────────────────────────────────────────
 STARTUP_TIMEOUT_SECS = 15       # how long to wait for port to open
@@ -414,7 +435,7 @@ async def process_submission(submission_id: str):
 
         # ── 2. Start container ────────────────────────────────────
         try:
-            container_id, endpoint_url, host_port = run_sandbox(image_tag, submission_id)
+            container_id, endpoint_url, sandbox_host, sandbox_port = run_sandbox(image_tag, submission_id)
             container = docker_client.containers.get(container_id)
         except Exception as e:
             print(f"[ERROR] Docker run failed: {e}")
@@ -450,9 +471,9 @@ async def process_submission(submission_id: str):
             return
 
         # ── 4. Wait for port to open (FAILED_STARTUP if timeout) ──
-        host = cfg.sandbox_host
-        port = host_port
-
+        host = sandbox_host
+        port = sandbox_port
+        
         print(f"[INFO] Waiting for sandbox to bind on port {port}...")
         started = wait_for_startup(host, port, STARTUP_TIMEOUT_SECS)
 
@@ -503,15 +524,15 @@ async def process_submission(submission_id: str):
 
         await trigger_fleet_commander(
             submission_id = submission_id,
-            host          = f"sandbox-{submission_id}",
-            port          = "9999",
+            host          = sandbox_host,
+            port          = str(sandbox_port),
             num_bots      = cfg.default_num_bots,
             duration_secs = cfg.default_duration_secs
         )
 
         await update_submission(db, submission_id, status="RUNNING")
 
-        cleanup_delay = cfg.default_duration_secs + 10
+        cleanup_delay = cfg.default_duration_secs + 300
         asyncio.create_task(
             cleanup_sandbox_after_run(
                 submission_id,

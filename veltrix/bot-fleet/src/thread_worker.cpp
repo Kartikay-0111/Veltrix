@@ -12,6 +12,8 @@ using namespace boost::asio::experimental::awaitable_operators;
 
 using namespace std::chrono_literals;
 
+static std::size_t parse_content_length(const std::string &header);
+
 ThreadWorker::ThreadWorker(int thread_id,
                            int bots_this_thread,
                            const BenchmarkConfig &cfg,
