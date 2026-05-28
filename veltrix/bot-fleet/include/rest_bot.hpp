@@ -2,6 +2,7 @@
 #include "bot_payload.hpp"
 #include <random>
 #include <array>
+#include <deque>
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -30,9 +31,14 @@ public:
     // ready to be written directly to a socket
     std::string build_http_request(const std::string &body) const;
 
+    // Called by ThreadWorker after a successful 200 response to track
+    // server-assigned order IDs for the cancel flow
+    void record_accepted_order(uint64_t order_id);
+
 private:
     uint64_t bot_id_;
     OrderType current_order_type_;
+    uint64_t order_counter_ = 0;
 
     // Each bot has its own RNG — zero contention, zero locking
     std::mt19937 rng_;
@@ -40,6 +46,10 @@ private:
     std::uniform_int_distribution<int> qty_dist_;    // 1–100 quantity
     std::uniform_int_distribution<int> ticker_dist_; // which symbol
     std::uniform_int_distribution<int> type_dist_;   // which order type
+
+    // Ring buffer of server-assigned order IDs for realistic cancel flow
+    static constexpr std::size_t MAX_TRACKED_ORDERS = 200;
+    std::deque<uint64_t> accepted_orders_;
 
     std::string make_limit_order(const char *type = "LIMIT");
     std::string make_market_order();

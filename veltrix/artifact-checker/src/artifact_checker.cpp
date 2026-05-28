@@ -154,13 +154,17 @@ void ArtifactChecker::parse_and_accumulate(const std::string &json)
     auto &state = states_[submission_id];
     state.submission_id = submission_id;
 
+    int64_t h200 = extract_int64(json, "http_200");
+    int64_t samples = extract_int64(json, "samples");
+
+    std::cout << "Parsed: " << submission_id << " http_200=" << h200 << " samples=" << samples << "\n";
+
     // Accumulate counters
-    state.successful_orders += extract_int64(json, "http_200");
-    state.total_orders += extract_int64(json, "samples");
+    state.successful_orders += h200;
+    state.total_orders += samples;
 
     // Merge histogram (the φ(a ∪ b) = φ(a) + φ(b) operation)
     auto hist_buckets = extract_hist(json);
-    int64_t samples = extract_int64(json, "samples");
     state.histogram.load(hist_buckets, samples);
 }
 

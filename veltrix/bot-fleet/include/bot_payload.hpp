@@ -23,18 +23,19 @@ enum class OrderType
     CANCEL
 };
 
-struct BotPayload
+class BotPayload
 {
-    virtual ~BotPayload() = default;
+    public:
+        virtual ~BotPayload() = default;
 
-    // Must produce a ready-to-send request string (HTTP body or WS frame)
-    virtual std::string generate_request() = 0;
+        // Must produce a ready-to-send request string (HTTP body or WS frame)
+        virtual std::string generate_request() = 0;
 
-    // Which order type this bot is currently sending
-    virtual OrderType order_type() const = 0;
+        // Which order type this bot is currently sending
+        virtual OrderType order_type() const = 0;
 
-    // Target endpoint this bot hammers
-    std::string target_host;
-    std::string target_port;
-    std::string target_path = "/order"; // REST endpoint on contestant's server
+        // Target endpoint this bot hammers
+        std::string target_host;
+        std::string target_port;
+        std::string target_path = "/order"; // REST endpoint on contestant's server
 };

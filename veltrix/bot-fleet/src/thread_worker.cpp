@@ -1,5 +1,6 @@
 #include "thread_worker.hpp"
 #include "rest_bot.hpp"
+#include <boost/asio/buffers_iterator.hpp>
 #include <iostream>
 #include <algorithm>
 #include <cctype>
@@ -96,6 +97,7 @@ asio::awaitable<void> ThreadWorker::run_bot(uint64_t bot_id)
     catch (const std::exception &e)
     {
         // ECONNREFUSED or DNS failure
+        std::cerr << "[run_bot] EXCEPTION ESCAPED! " << e.what() << "\n";
         ++counters_.counts[ECONNREF];
         // Don't crash — bot silently exits its coroutine
     }
@@ -186,6 +188,35 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
                 {
                     ++counters_.counts[OTHER_ERR];
                     continue;
+                }
+            }
+            // ── Feed server-assigned order IDs back to the bot for cancel flow ──
+            if (status == 200 && bot.order_type() != OrderType::CANCEL
+                && response_buf.size() > 0)
+            {
+                // Read body as string (non-destructive copy)
+                std::string resp_body(
+                    asio::buffers_begin(response_buf.data()),
+                    asio::buffers_end(response_buf.data()));
+
+                // Parse "order_id":<integer> from response JSON
+                auto id_pos = resp_body.find("\"order_id\":");
+                if (id_pos != std::string::npos)
+                {
+                    auto num_start = resp_body.find_first_of(
+                        "0123456789", id_pos + 11);
+                    if (num_start != std::string::npos)
+                    {
+                        auto num_end = resp_body.find_first_not_of(
+                            "0123456789", num_start);
+                        try
+                        {
+                            uint64_t oid = std::stoull(
+                                resp_body.substr(num_start, num_end - num_start));
+                            bot.record_accepted_order(oid);
+                        }
+                        catch (...) {}
+                    }
                 }
             }
             response_buf.consume(response_buf.size());

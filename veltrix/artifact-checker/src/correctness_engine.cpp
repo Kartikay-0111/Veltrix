@@ -82,10 +82,17 @@ uint64_t CorrectnessEngine::inject_watermark(const std::string &ticker,
          << "}";
 
     std::string response = http_post("/order", body.str());
-    if (response.empty())
+    if (response.empty()) {
+        std::cerr << "[Correctness] Empty response from /order endpoint!\n";
         return 0;
+    }
 
-    return parse_order_id(response);
+    uint64_t oid = parse_order_id(response);
+    if (oid == 0) {
+        std::cerr << "[Correctness] Failed to parse order_id from response: " << response << "\n";
+    }
+
+    return oid;
 }
 
 std::string CorrectnessEngine::fetch_book_snapshot(const std::string &ticker)
@@ -110,13 +117,16 @@ static int connect_to(const std::string &host, const std::string &port)
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
-    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0)
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) {
+        std::cerr << "[Correctness] getaddrinfo failed for " << host << ":" << port << "\n";
         return -1;
+    }
 
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0)
     {
         freeaddrinfo(res);
+        std::cerr << "[Correctness] socket() failed\n";
         return -1;
     }
 
@@ -127,6 +137,7 @@ static int connect_to(const std::string &host, const std::string &port)
 
     if (connect(fd, res->ai_addr, res->ai_addrlen) != 0)
     {
+        std::cerr << "[Correctness] connect() failed to " << host << ":" << port << " errno=" << errno << "\n";
         freeaddrinfo(res);
         close(fd);
         return -1;

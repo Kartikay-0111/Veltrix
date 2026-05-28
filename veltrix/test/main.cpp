@@ -582,6 +582,7 @@ public:
 
     OrderbookLevelInfos GetOrderInfos() const
     {
+        std::scoped_lock ordersLock{ordersMutex_};
         LevelInfos bidInfos, askInfos;
         bidInfos.reserve(bids_.size());
         askInfos.reserve(asks_.size());

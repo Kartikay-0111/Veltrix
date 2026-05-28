@@ -34,7 +34,7 @@ Veltrix is heavily decoupled into four specialized sub-systems to ensure microse
 
 ### Part 4: Real-Time Leaderboard
 *The live analytics interface.*
-* **Tech Stack:** Next.js, Redis (Sorted Sets), WebSockets.
+* **Tech Stack:** Go, Redis, WebSockets, Next.js.
 * **Function:** Consumes aggregated telemetry from the TimescaleDB/Redpanda pipeline and pushes live metrics via WebSockets to a Next.js dashboard, utilizing Redis Sorted Sets for $O(\log n)$ dynamic rankings.
 
 ---

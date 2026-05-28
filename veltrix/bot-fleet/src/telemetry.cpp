@@ -58,25 +58,41 @@ void TelemetryProducer::flush(const TelemetryCounters &c,
 
     try
     {
-        asio::io_context ioc;
-        tcp::resolver resolver(ioc);
-        beast::tcp_stream stream(ioc);
-        auto endpoints = resolver.resolve(host_, port_);
-        stream.connect(endpoints);
+        struct addrinfo hints{}, *res;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host_.c_str(), port_.c_str(), &hints, &res) != 0)
+            return;
 
-        http::request<http::string_body> req{http::verb::post, "/metrics", 11};
-        req.set(http::field::host, host_ + ":" + port_);
-        req.set(http::field::content_type, "application/json");
-        req.set(http::field::connection, "close");
-        req.body() = payload;
-        req.prepare_payload();
+        int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (sock < 0) {
+            freeaddrinfo(res);
+            return;
+        }
 
-        http::write(stream, req);
+        if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+            close(sock);
+            freeaddrinfo(res);
+            return;
+        }
+        freeaddrinfo(res);
 
-        beast::flat_buffer buffer;
-        http::response<http::string_body> res;
-        http::read(stream, buffer, res);
-        stream.socket().shutdown(tcp::socket::shutdown_both);
+        std::ostringstream req;
+        req << "POST /metrics HTTP/1.1\r\n"
+            << "Host: " << host_ << ":" << port_ << "\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << payload.size() << "\r\n"
+            << "Connection: close\r\n"
+            << "\r\n"
+            << payload;
+
+        std::string request_str = req.str();
+        send(sock, request_str.c_str(), request_str.size(), 0);
+
+        char buf[1024];
+        while (recv(sock, buf, sizeof(buf), 0) > 0) {}
+
+        close(sock);
     }
     catch (const std::exception &e)
     {

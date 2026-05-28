@@ -199,9 +199,9 @@ def render_dockerfile(language: str) -> str:
                 g++ cmake make libboost-all-dev \
                 && rm -rf /var/lib/apt/lists/*
             WORKDIR /app
-            COPY . /app/
-            RUN cmake -S . -B build --parallel $(nproc) \
-                && cmake --build build \
+            COPY src/ /app/
+            RUN cmake -S . -B build \
+                && cmake --build build --parallel $(nproc) \
                 && test -f build/server \
                 || (echo "ERROR: CMake build must produce a binary named 'server'" >&2 && exit 1)
             EXPOSE 9999
@@ -211,7 +211,7 @@ def render_dockerfile(language: str) -> str:
     elif language == "rust":
         return """FROM rust:1.78-slim
             WORKDIR /app
-            COPY . /app/
+            COPY src/ /app/
             RUN cargo build --release \
                 && test -f target/release/server \
                 || (echo "ERROR: Cargo build must produce a binary named 'server'" >&2 && exit 1)
@@ -222,7 +222,7 @@ def render_dockerfile(language: str) -> str:
     elif language == "go":
         return """FROM golang:1.22-bookworm
             WORKDIR /app
-            COPY . /app/
+            COPY src/ /app/
             RUN go build -o server . \
                 && test -f server \
                 || (echo "ERROR: Go build must produce a binary named 'server'" >&2 && exit 1)
@@ -288,7 +288,7 @@ def run_sandbox(image_tag: str, submission_id: str) -> tuple[str, str, str, int]
         network_disabled=False,     # needs network for bots to reach it
 
         # ── Resource limits ──────────────────────────────────────
-        pids_limit=100,             # max 100 processes
+        pids_limit=1000,            # max 1000 processes/threads
         # ports={"9999/tcp": None},   # random host port assigned by Docker
     )
 
