@@ -1,0 +1,25 @@
+{{define "row.html"}}
+<!--
+    hx-swap-oob="true" tells HTMX to find the element with this id
+    in the existing DOM and replace it — even though this fragment
+    arrives via WebSocket, not an HTMX request.
+
+    id must match exactly between updates so HTMX can find and replace it.
+    We use the submission_id since it's stable across all updates.
+-->
+<tr id="row-{{.SubmissionID}}" hx-swap-oob="true">
+    <td class="rank">—</td>
+    <td class="team-name">{{.TeamName}}</td>
+    <td class="tps-val">{{.TPS}}</td>
+    <td class="p50-val">{{printf "%.3f" .P50Ms}}</td>
+    <td class="p90-val">{{printf "%.3f" .P90Ms}}</td>
+    <td class="p99-val">{{printf "%.3f" .P99Ms}}</td>
+    <td>
+        {{if .IsCorrect}}
+            <span class="badge badge-pass">PASS</span>
+        {{else}}
+            <span class="badge badge-fail">FAIL</span>
+        {{end}}
+    </td>
+</tr>
+{{end}}

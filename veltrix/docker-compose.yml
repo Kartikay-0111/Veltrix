@@ -94,7 +94,7 @@ services:
     image: redpandadata/redpanda:latest
     depends_on:
       redpanda: { condition: service_healthy }
-    entrypoint: ["bash", "-lc", "rpk topic create order_metrics --brokers redpanda:9092 --partitions 6 --replicas 1 || true"]
+    entrypoint: ["bash", "-lc", "rpk topic create order_metrics --brokers redpanda:9092 --partitions 6 --replicas 1 || true; rpk topic create order_events --brokers redpanda:9092 --partitions 6 --replicas 1 || true"]
     networks: [backend] 
   # ── Your Services ────────────────────────────────────────────────
   submission-service:
@@ -110,19 +110,25 @@ services:
       minio:    { condition: service_healthy }
 
   telemetry-ingester:
-    build: ./telemetry-ingester
+    build:
+      context: .
+      dockerfile: ./telemetry-ingester/Dockerfile
     restart: always
     env_file: .env
     environment:
-      REDPANDA_PROXY_URL: http://redpanda:8082
-      REDPANDA_TOPIC: order_metrics
+      REDPANDA_BROKERS: redpanda:9092
+      ORDER_EVENTS_TOPIC: order_events
+      ORDER_METRICS_TOPIC: order_metrics
+      GRPC_PORT: 8091
+      HTTP_PORT: 8090
     ports:
       - "8090:8090"
+      - "8091:8091"
     networks: [backend]
     depends_on:
       redpanda: { condition: service_healthy }
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health').read()"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/health"]
       interval: 10s
       retries: 5
 
@@ -134,8 +140,11 @@ services:
       FLEET_COMMANDER_URL: http://bot-fleet:7070
       DEFAULT_NUM_BOTS: 100
       DEFAULT_DURATION_SECS: 60
+      SANDBOX_MANAGER_HEALTH_PORT: 8081
       PYTHONUNBUFFERED : 1
       SANDBOX_HOST: host.docker.internal
+    ports:
+      - "8081:8081"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock  # needs Docker access
     networks:
@@ -149,12 +158,13 @@ services:
       bot-fleet: { condition: service_started }
 
   bot-fleet:
-    build: ./bot-fleet
+    build:
+      context: .
+      dockerfile: ./bot-fleet/Dockerfile
     restart: always
     environment:
       FLEET_LISTEN_PORT: 7070
-      TELEMETRY_INGESTER_HOST: telemetry-ingester
-      TELEMETRY_INGESTER_PORT: 8090
+      TELEMETRY_GRPC_TARGET: telemetry-ingester:8091
     ports:
       - "7070:7070"   # FleetCommander HTTP trigger endpoint
     networks: [backend, sandbox-net]
@@ -176,21 +186,48 @@ services:
       - "host.docker.internal:host-gateway"
 
   artifact-checker:
-    build: ./artifact-checker
+    build: ./artifact-checker-go
     restart: always
     environment:
       REDPANDA_BROKERS:  redpanda:9092
+      ORDER_EVENTS_TOPIC: order_events
       METRICS_TOPIC:     order_metrics
       CONSUMER_GROUP:    artifact-checker
+      ALLOWED_LATENESS_MS: 2000
+      ARTIFACT_CHECKER_GOMAXPROCS: 1
       POSTGRES_HOST:     postgres
       POSTGRES_PORT:     5432
       POSTGRES_DB:       ${POSTGRES_DB}
       POSTGRES_USER:     ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST:        redis
+      REDIS_PORT:        6379
       SANDBOX_HOST:      ${ARTIFACT_SANDBOX_HOST:-sandbox-manager}   # set to sandbox-<submission_id>
       SANDBOX_PORT:      ${ARTIFACT_SANDBOX_PORT:-9999}
+      HEALTH_PORT:       8092
+    ports:
+      - "8092:8092"
     cpuset: "7"                            # pin to CPU core 7 (hardware isolation)
     networks: [backend, sandbox-net]
     depends_on:
       redpanda:  { condition: service_healthy }
       postgres:  { condition: service_healthy }
+      redis:     { condition: service_healthy }
+
+  leaderboard-service:
+    build: ./leaderboard-service
+    restart: always
+    environment:
+      POSTGRES_HOST:     postgres
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST:        redis
+      REDIS_PORT:        6379
+      PORT:              8085
+    ports:
+      - "8085:8085"
+    networks: [backend]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }

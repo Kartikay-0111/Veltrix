@@ -3,6 +3,13 @@
 #include <iomanip>
 #include <chrono>
 
+static int64_t epoch_nanoseconds()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 RestBot::RestBot(const std::string &host,
                  const std::string &port,
                  uint64_t bot_id)
@@ -48,26 +55,39 @@ std::string RestBot::generate_request()
         break;
     }
 
-    return  build_http_request(body);
+    return build_http_request(body);
 }
 
 std::string RestBot::make_limit_order(const char *type)
 {
-    auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::system_clock::now().time_since_epoch()
-    ).count();
+    const auto now = epoch_nanoseconds();
 
     // Generate globally unique ID (e.g., "Bot5-Order12")
     order_counter_++;
+    const std::string order_id = std::to_string(bot_id_) + "-" + std::to_string(order_counter_);
+    const std::string ticker = TICKERS[ticker_dist_(rng_)];
+    const std::string side = (rng_() % 2 == 0 ? "BUY" : "SELL");
+    const int price = price_dist_(rng_);
+    const int quantity = qty_dist_(rng_);
+
+    last_order_ = GeneratedOrder{
+        .order_id = order_id,
+        .action = side,
+        .type = type,
+        .ticker = ticker,
+        .price = static_cast<double>(price),
+        .quantity = quantity,
+        .event_timestamp_us = now / 1000,
+    };
     
     std::ostringstream oss;
     oss << "{"
-        << "\"order_id\":\"" << bot_id_ << "-" << order_counter_ << "\","
+        << "\"order_id\":\"" << order_id << "\","
         << "\"type\":\"" << type << "\","
-        << "\"ticker\":\"" << TICKERS[ticker_dist_(rng_)] << "\","
-        << "\"side\":\"" << (rng_() % 2 == 0 ? "BUY" : "SELL") << "\","
-        << "\"price\":" << price_dist_(rng_) << ".00,"
-        << "\"quantity\":" << qty_dist_(rng_) << ","
+        << "\"ticker\":\"" << ticker << "\","
+        << "\"side\":\"" << side << "\","
+        << "\"price\":" << price << ".00,"
+        << "\"quantity\":" << quantity << ","
         << "\"bot_id\":" << bot_id_ << ","
         << "\"timestamp\":" << now 
         << "}";
@@ -76,20 +96,32 @@ std::string RestBot::make_limit_order(const char *type)
 
 std::string RestBot::make_market_order()
 {
-    auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::system_clock::now().time_since_epoch()
-    ).count();
+    const auto now = epoch_nanoseconds();
 
     // Generate globally unique ID (e.g., "Bot5-Order12")
     order_counter_++;
+    const std::string order_id = std::to_string(bot_id_) + "-" + std::to_string(order_counter_);
+    const std::string ticker = TICKERS[ticker_dist_(rng_)];
+    const std::string side = (rng_() % 2 == 0 ? "BUY" : "SELL");
+    const int quantity = qty_dist_(rng_);
+
+    last_order_ = GeneratedOrder{
+        .order_id = order_id,
+        .action = side,
+        .type = "MARKET",
+        .ticker = ticker,
+        .price = 0.0,
+        .quantity = quantity,
+        .event_timestamp_us = now / 1000,
+    };
 
     std::ostringstream oss;
     oss << "{"
-        << "\"order_id\":\"" << bot_id_ << "-" << order_counter_ << "\","
+        << "\"order_id\":\"" << order_id << "\","
         << "\"type\":\"MARKET\","
-        << "\"ticker\":\"" << TICKERS[ticker_dist_(rng_)] << "\","
-        << "\"side\":\"" << (rng_() % 2 == 0 ? "BUY" : "SELL") << "\","
-        << "\"quantity\":" << qty_dist_(rng_) << ","
+        << "\"ticker\":\"" << ticker << "\","
+        << "\"side\":\"" << side << "\","
+        << "\"quantity\":" << quantity << ","
         << "\"bot_id\":" << bot_id_ << ","
         << "\"timestamp\":" << now 
         << "}";
@@ -101,7 +133,10 @@ std::string RestBot::make_cancel_order()
     // If we haven't received any accepted order IDs from the server yet,
     // fall back to a LIMIT order (can't cancel what we don't know)
     if (accepted_orders_.empty())
+    {
+        current_order_type_ = OrderType::LIMIT;
         return make_limit_order("LIMIT");
+    }
 
     // Pick a random order from our tracked list of server-assigned IDs
     std::uniform_int_distribution<std::size_t> dist(0, accepted_orders_.size() - 1);
@@ -111,9 +146,17 @@ std::string RestBot::make_cancel_order()
     // Remove it — can't cancel the same order twice
     accepted_orders_.erase(accepted_orders_.begin() + static_cast<std::ptrdiff_t>(idx));
 
-    auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::system_clock::now().time_since_epoch()
-    ).count();
+    const auto now = epoch_nanoseconds();
+
+    last_order_ = GeneratedOrder{
+        .order_id = std::to_string(target_id),
+        .action = "CANCEL",
+        .type = "CANCEL",
+        .ticker = "",
+        .price = 0.0,
+        .quantity = 0,
+        .event_timestamp_us = now / 1000,
+    };
 
     // Server expects: {"type":"cancel", "order_id": <integer>}
     std::ostringstream oss;
@@ -123,7 +166,7 @@ std::string RestBot::make_cancel_order()
         << "\"bot_id\":" << bot_id_ << ","
         << "\"timestamp\":" << now
         << "}";
-    return build_http_request(oss.str());
+    return oss.str();
 }
 
 void RestBot::record_accepted_order(uint64_t order_id)

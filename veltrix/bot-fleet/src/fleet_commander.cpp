@@ -1,4 +1,5 @@
 #include "fleet_commander.hpp"
+#include "grpc_telemetry.hpp"
 #include <iostream>
 #include <thread>
 #include <stdexcept>
@@ -8,11 +9,14 @@
 using namespace std::chrono_literals;
 
 FleetCommander::FleetCommander(uint16_t listen_port,
-                               std::string telemetry_ingester_host,
-                               std::string telemetry_ingester_port)
-    : listen_port_(listen_port), telemetry_ingester_host_(std::move(telemetry_ingester_host)), telemetry_ingester_port_(std::move(telemetry_ingester_port)), ioc_(1)
+                               const std::string &grpc_target)
+    : listen_port_(listen_port), grpc_target_(grpc_target), ioc_(1)
 {
+    // Create the long-lived gRPC channel at startup.
+    // This is thread-safe and internally multiplexed over HTTP/2.
+    grpc_client_ = std::make_shared<GrpcTelemetryClient>(grpc_target_);
 }
+
 void FleetCommander::run()
 {
     std::cout << "[FleetCommander] Listening on port " << listen_port_ << "\n";
@@ -39,7 +43,7 @@ void FleetCommander::run()
             }
         } 
         catch (const std::exception& e) {
-            // THE TRAP: If the network fails, it will now print to your terminal!
+            // THE TRAP: If the network fails, it will print to terminal
             std::cerr << "[FATAL ERROR] Acceptor coroutine crashed: " << e.what() << "\n";
         } }, asio::detached);
 
@@ -56,17 +60,17 @@ asio::awaitable<void> FleetCommander::handle_connection(tcp::socket socket)
 
         co_await http::async_read(socket, buffer, req, asio::use_awaitable);
 
-        // if (req.method() == http::verb::get &&
-        //     req.target() == "/health")
-        // {
-        //     // Health check endpoint for Docker/K8s probes
-        //     http::response<http::string_body> res{http::status::ok, req.version()};
-        //     res.set(http::field::content_type, "application/json");
-        //     res.body() = "{\"status\":\"ok\"}";
-        //     res.prepare_payload();
-        //     co_await http::async_write(socket, res, asio::use_awaitable);
-        //     co_return;
-        // }
+        if (req.method() == http::verb::get &&
+            req.target() == "/health")
+        {
+            // Health check endpoint for Docker/K8s probes
+            http::response<http::string_body> res{http::status::ok, req.version()};
+            res.set(http::field::content_type, "application/json");
+            res.body() = "{\"status\":\"ok\"}";
+            res.prepare_payload();
+            co_await http::async_write(socket, res, asio::use_awaitable);
+            co_return;
+        }
 
         if (req.method() == http::verb::post &&
             req.target() == "/benchmark")
@@ -114,11 +118,8 @@ void FleetCommander::launch_benchmark(const BenchmarkConfig &cfg)
               << "  target        : " << cfg.target_host << ":" << cfg.target_port << "\n"
               << "  total bots    : " << cfg.num_bots << "\n"
               << "  cores         : " << num_cores << "\n"
-              << "  duration      : " << cfg.duration_secs << "s\n";
-
-    // ── One shared telemetry client (thread-safe enough for low-frequency flushes) ──
-    auto producer = std::make_shared<TelemetryProducer>(
-        telemetry_ingester_host_, telemetry_ingester_port_);
+              << "  duration      : " << cfg.duration_secs << "s\n"
+              << "  gRPC target   : " << grpc_target_ << "\n";
 
     // ── Divide bots evenly across cores ──────────────────────────────────────
     int bots_per_core = cfg.num_bots / num_cores;
@@ -131,15 +132,14 @@ void FleetCommander::launch_benchmark(const BenchmarkConfig &cfg)
     {
         // Give leftover bots to the first worker
         int bots = bots_per_core + (i == 0 ? leftover_bots : 0);
-        workers.push_back(std::make_unique<ThreadWorker>(i, bots, cfg, producer));
+        workers.push_back(std::make_unique<ThreadWorker>(i, bots, cfg, grpc_client_));
     }
 
     // ── Start all workers ─────────────────────────────────────────────────────
     for (auto &w : workers)
         w->start();
 
-    std::cout << "[FleetCommander] All workers running. Duration: "
-              << cfg.duration_secs << "s\n";
+    std::cout << "[FleetCommander] All workers running. Duration: "<< cfg.duration_secs << "s\n";
 
     // ── Wait for benchmark duration ───────────────────────────────────────────
     std::this_thread::sleep_for(std::chrono::seconds(cfg.duration_secs));
@@ -150,8 +150,7 @@ void FleetCommander::launch_benchmark(const BenchmarkConfig &cfg)
     for (auto &w : workers)
         w->join();
 
-    std::cout << "[FleetCommander] Benchmark complete for "
-              << cfg.submission_id << "\n";
+    std::cout << "[FleetCommander] Benchmark complete for "<< cfg.submission_id << "\n";
 }
 
 BenchmarkConfig FleetCommander::parse_benchmark_request(const std::string &body)
@@ -165,8 +164,6 @@ BenchmarkConfig FleetCommander::parse_benchmark_request(const std::string &body)
     cfg.protocol = extract_json_string(body, "protocol");
     cfg.num_bots = extract_json_int(body, "num_bots");
     cfg.duration_secs = extract_json_int(body, "duration_secs");
-    cfg.telemetry_ingester_host = telemetry_ingester_host_;
-    cfg.telemetry_ingester_port = telemetry_ingester_port_;
 
     if (cfg.num_bots <= 0)
         cfg.num_bots = 1000;

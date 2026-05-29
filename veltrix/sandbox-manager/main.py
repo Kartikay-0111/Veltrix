@@ -1,6 +1,9 @@
 # sandbox-manager/main.py
 import os, time, uuid, tarfile, tempfile, docker, redis, asyncpg, asyncio, boto3, socket, zipfile, shutil, stat
 import httpx
+import threading
+import http.server
+import json
 from pathlib import PurePosixPath
 from docker.errors import NotFound, APIError
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -31,8 +34,33 @@ class Settings(BaseSettings):
     # Benchmark defaults (can be overridden per-job)
     default_num_bots: int = 100
     default_duration_secs: int = 60
+    sandbox_manager_health_port: int = 8081
 
 cfg = Settings()
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        payload = {"status": "ok"}
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+def start_health_server(port: int) -> None:
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[INFO] Health server listening on :{port}")
+
 
 docker_client = docker.from_env()
 redis_client  = redis.Redis(host=cfg.redis_host, port=cfg.redis_port, decode_responses=True)
@@ -565,4 +593,5 @@ async def main():
             await process_submission(submission_id)
 
 if __name__ == "__main__":
+    start_health_server(cfg.sandbox_manager_health_port)
     asyncio.run(main())

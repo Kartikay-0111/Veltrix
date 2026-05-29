@@ -1,0 +1,212 @@
+{{define "base.html"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Veltrix — Live Leaderboard</title>
+
+    <!-- HTMX + WebSocket extension -->
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/ws.js"></script>
+
+    <!-- Minimal CSS — no framework, pure speed -->
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background: #0a0a0f;
+            color: #e2e8f0;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            min-height: 100vh;
+        }
+
+        header {
+            border-bottom: 1px solid #1e293b;
+            padding: 1.5rem 2rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        header h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #38bdf8;
+            letter-spacing: -0.5px;
+        }
+
+        .live-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: #052e16;
+            border: 1px solid #16a34a;
+            color: #4ade80;
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 3px 10px;
+            border-radius: 9999px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #4ade80;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50%       { opacity: 0.2; }
+        }
+
+        main { padding: 2rem; }
+
+        .subtitle {
+            color: #64748b;
+            font-size: 0.85rem;
+            margin-bottom: 1.5rem;
+        }
+
+        /* Table */
+        .table-wrap {
+            overflow-x: auto;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+        }
+
+        thead tr {
+            background: #0f172a;
+            border-bottom: 1px solid #1e293b;
+        }
+
+        th {
+            padding: 0.75rem 1.25rem;
+            text-align: left;
+            color: #64748b;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        tbody tr {
+            border-bottom: 1px solid #111827;
+            transition: background 0.15s;
+        }
+
+        tbody tr:hover { background: #0f172a; }
+        tbody tr:last-child { border-bottom: none; }
+
+        td {
+            padding: 0.875rem 1.25rem;
+            white-space: nowrap;
+        }
+
+        /* Rank column */
+        .rank { color: #94a3b8; font-weight: 600; }
+        .rank-1 { color: #fbbf24; }
+        .rank-2 { color: #94a3b8; }
+        .rank-3 { color: #cd7c2f; }
+
+        /* Team name */
+        .team-name { color: #e2e8f0; font-weight: 600; }
+
+        /* Metric values */
+        .tps-val   { color: #38bdf8; font-weight: 700; }
+        .p50-val   { color: #a3e635; }
+        .p90-val   { color: #fb923c; }
+        .p99-val   { color: #f87171; font-weight: 600; }
+
+        /* Correctness badge */
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .badge-pass { background: #052e16; color: #4ade80; border: 1px solid #16a34a; }
+        .badge-fail { background: #2d0d0d; color: #f87171; border: 1px solid #991b1b; }
+
+        /* Row update flash animation */
+        @keyframes flash {
+            0%   { background: #1e3a5f; }
+            100% { background: transparent; }
+        }
+        .htmx-swapping { animation: flash 0.6s ease-out; }
+
+        /* Empty state */
+        .empty-state {
+            text-align: center;
+            padding: 4rem;
+            color: #334155;
+        }
+        .empty-state p { margin-top: 0.5rem; font-size: 0.85rem; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>⚡ Veltrix</h1>
+        <span class="live-badge">
+            <span class="dot"></span>
+            Live
+        </span>
+    </header>
+
+    <main>
+        <p class="subtitle">
+            Results update in real-time as the bot fleet benchmarks each submission.
+        </p>
+
+        <div class="table-wrap">
+            <!--
+                hx-ext="ws"          → enable WebSocket extension
+                ws-connect           → connect to the Go WebSocket server
+                The server sends <tr id="row-{id}" hx-swap-oob="true"> fragments.
+                HTMX's OOB swap finds each row by id and replaces it in place.
+            -->
+            <div hx-ext="ws" ws-connect="/ws/leaderboard">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Team</th>
+                            <th>TPS</th>
+                            <th>p50 (ms)</th>
+                            <th>p90 (ms)</th>
+                            <th>p99 (ms)</th>
+                            <th>Correct</th>
+                        </tr>
+                    </thead>
+                    <tbody id="leaderboard-body">
+                        <!-- Rows are injected here by HTMX OOB swaps -->
+                        <tr id="empty-row">
+                            <td colspan="7">
+                                <div class="empty-state">
+                                    <div>⏳ Waiting for submissions...</div>
+                                    <p>Results will appear here as benchmarks complete.</p>
+                                </div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </main>
+</body>
+</html>
+{{end}}

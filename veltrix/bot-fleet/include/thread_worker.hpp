@@ -16,10 +16,15 @@
 #include <string>
 #include <vector>
 #include "telemetry.hpp"
+#include "audit_log.hpp"
 #include "bot_payload.hpp"
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
+
+class RestBot;
+class GrpcTelemetryClient;
+struct StreamHandle;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BenchmarkConfig — passed to every thread worker at launch
@@ -32,8 +37,6 @@ struct BenchmarkConfig
     int num_bots; // total bots across ALL threads
     int duration_secs;
     std::string protocol; // "rest" | "websocket"
-    std::string telemetry_ingester_host;
-    std::string telemetry_ingester_port;
     int flush_interval_ms = 500;
 };
 
@@ -43,6 +46,7 @@ struct BenchmarkConfig
 // Owns:
 //   - Its own io_context (mapped to a private io_uring instance in kernel)
 //   - Its own TelemetryCounters (lock-free, no sharing)
+//   - Its own AuditLog for correctness event capture
 //   - A slice of the total bot count
 //
 // Threading model: shared-nothing. Zero mutexes. Zero locks.
@@ -53,7 +57,7 @@ public:
     ThreadWorker(int thread_id,
                  int bots_this_thread,
                  const BenchmarkConfig &cfg,
-                 std::shared_ptr<TelemetryProducer> producer);
+                 std::shared_ptr<GrpcTelemetryClient> grpc_client);
 
     // Launch the worker on its own OS thread. Returns immediately.
     void start();
@@ -70,7 +74,7 @@ private:
     int thread_id_;
     int bots_this_thread_;
     BenchmarkConfig cfg_;
-    std::shared_ptr<TelemetryProducer> producer_;
+    std::shared_ptr<GrpcTelemetryClient> grpc_client_;
 
     // Each worker owns its io_context — backed by its own io_uring instance
     asio::io_context ioc_;
@@ -78,6 +82,10 @@ private:
     std::jthread thread_; // C++20 — auto-joins on destruction
 
     TelemetryCounters counters_; // private, never shared
+    AuditLog audit_log_;         // private correctness event buffer (shared-nothing)
+
+    // gRPC stream handle — opened at benchmark start, closed at end
+    std::unique_ptr<StreamHandle> grpc_stream_;
 
     // ── Core coroutines (these run inside the event loop) ─────────────────────
 

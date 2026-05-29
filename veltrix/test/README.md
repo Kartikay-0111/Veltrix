@@ -1,13 +1,13 @@
-# Test Submission Folder
+# Sample Submission Bundle
 
-This folder is a self-contained submission bundle for the orderbook engine.
+This folder contains a reference submission that matches the sandbox contract.
 
-## Submission contract
+## Submission Contract
 
-- Archive format: `.tar.gz` of this project root
-- Root build file: `CMakeLists.txt`
-- Binary name: `server`
-- Listening port: `9999`
+- Archive format: `.tar.gz` of this project root.
+- Required build file: `CMakeLists.txt` at the root.
+- Required binary name: `server`.
+- Required listen port: `9999`.
 - Required HTTP routes:
   - `POST /order`
   - `DELETE /order/{id}`
@@ -16,20 +16,16 @@ This folder is a self-contained submission bundle for the orderbook engine.
 
 ## Build
 
-The root `CMakeLists.txt` builds `server` from `main.cpp`.
-
-Example build:
-
 ```bash
 cmake -S . -B build
 cmake --build build
 ./build/server
 ```
 
-## Runtime notes
+## Runtime Notes
 
-- The service listens on port `9999`.
-- `GET /health` returns a basic status JSON response.
+- The server listens on port `9999`.
+- `GET /health` returns a status JSON response.
 - `GET /book/{ticker}` returns the current order book snapshot.
 - `POST /order` accepts order submissions.
 - `DELETE /order/{id}` cancels an existing order.

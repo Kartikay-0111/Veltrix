@@ -2,6 +2,7 @@
 #include "bot_payload.hpp"
 #include <random>
 #include <array>
+#include <cstdint>
 #include <deque>
 #include <string>
 
@@ -15,6 +16,17 @@
 // Tickers the bots trade — simulates a real multi-symbol exchange
 static constexpr std::array<const char *, 5> TICKERS = {
     "AAPL", "GOOGL", "MSFT", "TSLA", "AMZN"};
+
+struct GeneratedOrder
+{
+    std::string order_id;
+    std::string action; // BUY | SELL | CANCEL
+    std::string type;
+    std::string ticker;
+    double price = 0.0;
+    int quantity = 0;
+    int64_t event_timestamp_us = 0;
+};
 
 class RestBot : public BotPayload
 {
@@ -35,10 +47,13 @@ public:
     // server-assigned order IDs for the cancel flow
     void record_accepted_order(uint64_t order_id);
 
+    const GeneratedOrder &last_order() const { return last_order_; }
+
 private:
     uint64_t bot_id_;
     OrderType current_order_type_;
     uint64_t order_counter_ = 0;
+    GeneratedOrder last_order_;
 
     // Each bot has its own RNG — zero contention, zero locking
     std::mt19937 rng_;

@@ -1,46 +1,71 @@
-# Veltrix — Benchmarking at Scale
+# Veltrix (IICPC) - Distributed Benchmarking Platform
 
-## Overview
-**Veltrix** is a highly concurrent, distributed benchmarking and hosting platform built for the IICPC Summer Hackathon 2026. Designed for hardcore systems engineering, Veltrix evaluates contestant-submitted, high-frequency trading infrastructure (e.g., simulated orderbooks, matching engines). 
+Veltrix is a distributed benchmarking platform for high-frequency trading engines built for the IICPC Summer Hackathon 2026. It securely hosts untrusted submissions, drives deterministic load with a C++ bot fleet, aggregates telemetry with event-time correctness checks, and streams a live leaderboard.
 
-Drawing architectural inspiration from massive open-source testing suites like DataStax's *Fallout*, Veltrix securely hosts untrusted code and bombards it with a distributed fleet of trading bots. It accurately captures granular telemetry without skewing target performance, ensuring a fair, precise, and highly scalable competition.
+This repository is organized as a monorepo. The production services live under [veltrix/](veltrix/).
 
-## Key Objectives
-* **Simulate Peak Market Volatility:** Generate massive, concurrent order traffic (FIX, REST, WebSockets) via a distributed load generator.
-* **Precision Telemetry:** Accurately measure p50, p90, and p99 latencies using High Dynamic Range (HDR) Histograms, alongside maximum throughput (TPS).
-* **Correctness Validation:** Verify price-time priority and trade fill accuracy without data loss.
-* **Strict Security & Fairness:** Run untrusted contestant code in strictly isolated environments with identical CPU/Memory constraints.
+## Quick Navigation
 
----
+- Local setup: [SETUP.md](SETUP.md)
+- Running locally: [RUNNING.md](RUNNING.md)
+- Troubleshooting: [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+- System architecture: [ARCHITECTURE.md](ARCHITECTURE.md)
+- Onboarding guide: [docs/ONBOARDING.md](docs/ONBOARDING.md)
+- Service dependency map: [docs/SERVICE_DEPENDENCIES.md](docs/SERVICE_DEPENDENCIES.md)
+- Technical debt report: [docs/TECH_DEBT.md](docs/TECH_DEBT.md)
 
-## System Architecture: The 4 Core Components
+## System Purpose
 
-Veltrix is heavily decoupled into four specialized sub-systems to ensure microsecond-level precision and horizontal scalability.
+Veltrix provides a safe, reproducible environment to benchmark contestant orderbooks/matching engines under heavy load while enforcing correctness (price-time priority) and fairness (resource isolation). The platform is designed for local docker-compose development and for production-scale orchestration in the future.
 
-### Part 1: Submission & Sandboxing Engine
-*The secure ingestion and orchestration pipeline.*
-* **Tech Stack:** Python (FastAPI), Docker SDK / Kubernetes, MinIO (S3), PostgreSQL, Redis.
-* **Function:** Contestants upload their code. The FastAPI backend securely chunks the upload to MinIO. The Sandbox Manager dynamically provisions highly isolated containers/Pods, enforces strict resource limits, executes the code, and utilizes active TCP health checks to verify readiness.
+## High-Level Architecture
 
-### Part 2: Distributed Bot Fleet
-*The highly concurrent load generators.*
-* **Tech Stack:** C++20, gRPC.
-* **Function:** Once a sandbox is `READY`, a vast fleet of stateless bots awakens. Written in C++ to avoid Garbage Collection (GC) pauses, these bots bombard the contestant's predefined endpoints based on the modular test configuration.
+```mermaid
+flowchart LR
+	A[Submission Service] --> B[MinIO Object Storage]
+	A --> C[(Postgres)]
+	A --> D[Redis Queue]
+	D --> E[Sandbox Manager]
+	E --> F[Contestant Sandbox]
+	E --> G[Bot Fleet]
+	G --> H[gRPC Telemetry Ingester]
+	H --> I[Redpanda Topics]
+	I --> J[Artifact Checker]
+	J --> C
+	J --> K[Redis Leaderboard]
+	K --> L[Leaderboard Service]
+```
 
-### Part 3: Telemetry & Correctness Ingester
-*The low-latency tracking pipeline.*
-* **Tech Stack:** C++20, Redpanda (Kafka-compatible), TimescaleDB, HdrHistogram.
-* **Function:** Bots record latencies locally using HDR Histograms and stream logs via Redpanda into a dedicated Artifact Checker. The checker merges logs to calculate true p99 latencies and validates raw transaction logs for price-time priority accuracy.
+## Tech Stack
 
-### Part 4: Real-Time Leaderboard
-*The live analytics interface.*
-* **Tech Stack:** Go, Redis, WebSockets, Next.js.
-* **Function:** Consumes aggregated telemetry from the TimescaleDB/Redpanda pipeline and pushes live metrics via WebSockets to a Next.js dashboard, utilizing Redis Sorted Sets for $O(\log n)$ dynamic rankings.
+- Python 3.12 (submission-service, sandbox-manager)
+- C++20 with Boost.Asio io_uring (bot-fleet)
+- Go (telemetry-ingester, artifact-checker, leaderboard-service)
+- PostgreSQL + TimescaleDB (metadata, leaderboard metrics)
+- Redis (queues, leaderboard cache/pubsub)
+- MinIO (submission artifacts)
+- Redpanda (Kafka-compatible event bus)
+- Docker + docker-compose (local dev)
 
----
+## Microservices Overview
 
-## Deployment & IaC
-Veltrix is designed from the ground up for cloud deployment:
-* **Local Development:** Orchestrated via `docker-compose`.
-* **Cloud Infrastructure:** Kubernetes (K8s) for distributed container orchestration.
-* **Infrastructure as Code (IaC):** Terraform scripts to automate the provisioning of VPCs, Subnets, Kubernetes clusters, and storage buckets.
+| Service | Path | Purpose | Ports |
+| --- | --- | --- | --- |
+| Submission Service | [veltrix/submission-service](veltrix/submission-service) | Ingests submissions, stores artifacts, enqueues sandbox jobs. | 8080 |
+| Sandbox Manager | [veltrix/sandbox-manager](veltrix/sandbox-manager) | Builds and runs contestant sandboxes, triggers benchmarks. | 8081 (health) |
+| Bot Fleet | [veltrix/bot-fleet](veltrix/bot-fleet) | High-concurrency load generator with gRPC telemetry. | 7070 |
+| Telemetry Ingester | [veltrix/telemetry-ingester](veltrix/telemetry-ingester) | Accepts gRPC telemetry, publishes to Redpanda. | 8090, 8091 |
+| Artifact Checker | [veltrix/artifact-checker-go](veltrix/artifact-checker-go) | Reorders events, validates correctness, aggregates metrics. | 8092 (health) |
+| Leaderboard Service | [veltrix/leaderboard-service](veltrix/leaderboard-service) | Web UI + WebSocket broadcaster for live rankings. | 8085 |
+
+## Repository Layout
+
+```
+.
+├── veltrix/                 # All microservices and docker-compose
+├── docs/                    # Onboarding and technical debt docs
+├── SETUP.md
+├── RUNNING.md
+├── TROUBLESHOOTING.md
+└── ARCHITECTURE.md
+```

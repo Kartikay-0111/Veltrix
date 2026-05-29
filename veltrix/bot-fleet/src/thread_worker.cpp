@@ -1,11 +1,14 @@
 #include "thread_worker.hpp"
 #include "rest_bot.hpp"
+#include "grpc_telemetry.hpp"
 #include <boost/asio/buffers_iterator.hpp>
 #include <iostream>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <optional>
 #include <pthread.h>
+#include <regex>
 #include <sched.h>
 // Awaitable operator overloads (e.g. a || b)
 #include <boost/asio/experimental/awaitable_operators.hpp>
@@ -14,12 +17,85 @@ using namespace boost::asio::experimental::awaitable_operators;
 using namespace std::chrono_literals;
 
 static std::size_t parse_content_length(const std::string &header);
+static std::optional<double> extract_json_number(const std::string &json,
+                                                 const std::string &key);
+static std::string extract_json_string(const std::string &json,
+                                       const std::string &key);
+static std::string extract_json_scalar(const std::string &json,
+                                       const std::string &key);
+
+// ─── Minimal trades[] array parser ───────────────────────────────────────────
+// Extracts individual trade objects from the JSON trades array in the response.
+// Example input: {"order_id":1,"ticker":"AAPL","trades":[{"buy_order_id":1,"sell_order_id":2,"price":100,"qty":15}]}
+struct ParsedTrade
+{
+    uint64_t buy_order_id = 0;
+    uint64_t sell_order_id = 0;
+    double price = 0.0;
+    int qty = 0;
+};
+
+static std::vector<ParsedTrade> parse_trades_array(const std::string &json)
+{
+    std::vector<ParsedTrade> trades;
+
+    // Find the "trades" array
+    auto trades_pos = json.find("\"trades\"");
+    if (trades_pos == std::string::npos)
+        return trades;
+
+    auto bracket_start = json.find('[', trades_pos);
+    if (bracket_start == std::string::npos)
+        return trades;
+
+    auto bracket_end = json.find(']', bracket_start);
+    if (bracket_end == std::string::npos)
+        return trades;
+
+    // Extract the array content
+    std::string arr = json.substr(bracket_start + 1, bracket_end - bracket_start - 1);
+    if (arr.empty())
+        return trades;
+
+    // Parse each trade object { ... }
+    std::size_t pos = 0;
+    while (pos < arr.size())
+    {
+        auto obj_start = arr.find('{', pos);
+        if (obj_start == std::string::npos)
+            break;
+
+        auto obj_end = arr.find('}', obj_start);
+        if (obj_end == std::string::npos)
+            break;
+
+        std::string obj = arr.substr(obj_start, obj_end - obj_start + 1);
+
+        ParsedTrade trade;
+        if (auto v = extract_json_number(obj, "buy_order_id"))
+            trade.buy_order_id = static_cast<uint64_t>(*v);
+        if (auto v = extract_json_number(obj, "sell_order_id"))
+            trade.sell_order_id = static_cast<uint64_t>(*v);
+        if (auto v = extract_json_number(obj, "price"))
+            trade.price = *v;
+        if (auto v = extract_json_number(obj, "qty"))
+            trade.qty = static_cast<int>(*v);
+        else if (auto v2 = extract_json_number(obj, "quantity"))
+            trade.qty = static_cast<int>(*v2);
+
+        trades.push_back(trade);
+        pos = obj_end + 1;
+    }
+
+    return trades;
+}
 
 ThreadWorker::ThreadWorker(int thread_id,
                            int bots_this_thread,
                            const BenchmarkConfig &cfg,
-                           std::shared_ptr<TelemetryProducer> producer)
-    : thread_id_(thread_id), bots_this_thread_(bots_this_thread), cfg_(cfg), producer_(std::move(producer)), ioc_(1) // 1 thread per io_context → maps to 1 io_uring instance
+                           std::shared_ptr<GrpcTelemetryClient> grpc_client)
+    : thread_id_(thread_id), bots_this_thread_(bots_this_thread),
+      cfg_(cfg), grpc_client_(std::move(grpc_client)), ioc_(1)
 {
 }
 
@@ -41,6 +117,17 @@ void ThreadWorker::start()
         std::cout << "[Worker " << thread_id_ << "] Starting "
                   << bots_this_thread_ << " bots on core " << thread_id_ << "\n";
 
+        // ── Open the gRPC stream for this benchmark ──────────────────────────
+        try
+        {
+            grpc_stream_ = grpc_client_->open_stream();
+            std::cout << "[Worker " << thread_id_ << "] gRPC stream opened\n";
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[Worker " << thread_id_ << "] gRPC stream open failed: " << e.what() << "\n";
+        }
+
         // ── Spawn all bot coroutines into this thread's event loop ────────────
         for (int i = 0; i < bots_this_thread_; ++i) {
             uint64_t bot_id = static_cast<uint64_t>(thread_id_) * 10000 + i;
@@ -54,6 +141,23 @@ void ThreadWorker::start()
         // io_uring handles ALL I/O multiplexing inside here.
         // No threads are blocked waiting for sockets. Ever.
         ioc_.run();
+
+        // ── Final flush: send any remaining events before closing ─────────────
+        if (grpc_stream_ && (!audit_log_.empty() || counters_.latency_samples > 0))
+        {
+            grpc_client_->send_batch(*grpc_stream_, audit_log_, counters_,
+                                     cfg_.submission_id, thread_id_);
+            audit_log_.clear();
+            counters_.reset();
+        }
+
+        // ── Close the gRPC stream ─────────────────────────────────────────────
+        if (grpc_stream_)
+        {
+            auto response = grpc_client_->finish(*grpc_stream_);
+            std::cout << "[Worker " << thread_id_ << "] gRPC stream closed\n";
+            grpc_stream_.reset();
+        }
 
         std::cout << "[Worker " << thread_id_ << "] Stopped.\n"; });
 }
@@ -107,8 +211,8 @@ asio::awaitable<void> ThreadWorker::run_bot(uint64_t bot_id)
 // send_orders — the inner hot loop
 //
 // Fires one request, awaits response, records latency, repeat.
-// The co_await calls are what make this non-blocking — the thread
-// is free to process other bots while waiting for network I/O.
+// Captures Intent (OrderSubmitted) BEFORE sending, and Observation
+// (TradeExecuted, unrolled) AFTER receiving response.
 // ─────────────────────────────────────────────────────────────────────────────
 asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
                                                 uint64_t bot_id)
@@ -121,6 +225,19 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
     while (running_ && std::chrono::steady_clock::now() < deadline)
     {
         std::string request = bot.generate_request();
+
+        // ── INTENT: capture OrderSubmitted BEFORE sending ─────────────────────
+        const auto &last = bot.last_order();
+        audit_log_.record_order(
+            cfg_.submission_id,
+            static_cast<int32_t>(bot_id),
+            last.order_id,
+            last.type,                       // action = LIMIT | MARKET | CANCEL | FOK | FAK | GFD
+            last.type == "CANCEL" ? "" : last.action,  // side = BUY | SELL (empty for CANCEL)
+            last.ticker,
+            last.price,
+            last.quantity,
+            /* cancel_target_id */ 0);
 
         // ── Record start time (nanosecond precision) ──────────────────────────
         auto t0 = std::chrono::steady_clock::now();
@@ -153,13 +270,9 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
                 continue;
             }
 
-            auto t1 = std::chrono::steady_clock::now();
-            double lat = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
             if (timed_out)
             {
-                ++counters_.counts[TIMEOUT];
-                counters_.record_latency(1000.0); // penalise timeout as 1s
+                record(0, 1000.0, true); // penalise timeout as 1s
                 continue;
             }
 
@@ -190,38 +303,59 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
                     continue;
                 }
             }
-            // ── Feed server-assigned order IDs back to the bot for cancel flow ──
-            if (status == 200 && bot.order_type() != OrderType::CANCEL
-                && response_buf.size() > 0)
+
+            auto t1 = std::chrono::steady_clock::now();
+            double lat = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            std::string response_body;
+            if (response_buf.size() > 0)
             {
-                // Read body as string (non-destructive copy)
-                std::string resp_body(
+                response_body.assign(
                     asio::buffers_begin(response_buf.data()),
                     asio::buffers_end(response_buf.data()));
+            }
 
-                // Parse "order_id":<integer> from response JSON
-                auto id_pos = resp_body.find("\"order_id\":");
-                if (id_pos != std::string::npos)
+            // ── Stream A: latency/throughput metrics ─────────────────────────
+            record(status, lat, false);
+
+            // ── Stream B: OBSERVATION — parse and unroll trades ──────────────
+            if (status == 200 && !response_body.empty())
+            {
+                // Extract the server-assigned order_id
+                std::string order_id_text = extract_json_scalar(response_body, "order_id");
+                uint64_t contestant_order_id = 0;
+                if (!order_id_text.empty())
                 {
-                    auto num_start = resp_body.find_first_of(
-                        "0123456789", id_pos + 11);
-                    if (num_start != std::string::npos)
-                    {
-                        auto num_end = resp_body.find_first_not_of(
-                            "0123456789", num_start);
-                        try
-                        {
-                            uint64_t oid = std::stoull(
-                                resp_body.substr(num_start, num_end - num_start));
-                            bot.record_accepted_order(oid);
-                        }
-                        catch (...) {}
-                    }
+                    try { contestant_order_id = std::stoull(order_id_text); }
+                    catch (...) {}
+                }
+
+                // Unroll each individual trade from the trades[] array
+                auto trades = parse_trades_array(response_body);
+                for (const auto &trade : trades)
+                {
+                    // Determine which side is the "matched" resting order
+                    uint64_t matched_id = (trade.buy_order_id == contestant_order_id)
+                                              ? trade.sell_order_id
+                                              : trade.buy_order_id;
+
+                    audit_log_.record_trade(
+                        cfg_.submission_id,
+                        static_cast<int32_t>(bot_id),
+                        last.ticker,
+                        contestant_order_id,
+                        matched_id,
+                        trade.price,
+                        trade.qty);
+                }
+
+                // Feed server-assigned order IDs back to the bot for cancel flow
+                if (bot.order_type() != OrderType::CANCEL && contestant_order_id > 0)
+                {
+                    bot.record_accepted_order(contestant_order_id);
                 }
             }
             response_buf.consume(response_buf.size());
-
-            record(status, lat, false);
         }
         catch (const boost::system::system_error &e)
         {
@@ -236,6 +370,9 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
 // We use boost::asio::steady_timer instead of sleep_for() so the thread
 // is NEVER blocked — it stays in the event loop processing bot sockets
 // while the timer is pending.
+//
+// Sends AuditLog (orders + trades) and TelemetryCounters via gRPC as a
+// single compressed protobuf AuditBatch.
 // ─────────────────────────────────────────────────────────────────────────────
 asio::awaitable<void> ThreadWorker::flush_loop()
 {
@@ -247,10 +384,30 @@ asio::awaitable<void> ThreadWorker::flush_loop()
         timer.expires_after(std::chrono::milliseconds(cfg_.flush_interval_ms));
         co_await timer.async_wait(asio::use_awaitable);
 
-        // Produce current snapshot to the telemetry ingester
-        producer_->flush(counters_, cfg_.submission_id, thread_id_);
+        // Send the audit batch via gRPC
+        if (grpc_stream_ && (!audit_log_.empty() || counters_.latency_samples > 0))
+        {
+            bool ok = grpc_client_->send_batch(*grpc_stream_, audit_log_, counters_,
+                                                cfg_.submission_id, thread_id_);
+            if (!ok)
+            {
+                std::cerr << "[Worker " << thread_id_ << "] gRPC batch send failed, "
+                          << "reopening stream\n";
+                try
+                {
+                    grpc_stream_ = grpc_client_->open_stream();
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr << "[Worker " << thread_id_ << "] gRPC stream reopen failed: "
+                              << e.what() << "\n";
+                    grpc_stream_.reset();
+                }
+            }
+        }
 
-        // Reset counters for next window
+        // Reset counters and audit log for next window
+        audit_log_.clear();
         counters_.reset();
     }
 }
@@ -303,6 +460,7 @@ void ThreadWorker::record(int status_code, double latency_ms, bool timed_out)
     if (timed_out)
     {
         ++counters_.counts[TIMEOUT];
+        counters_.record_latency(latency_ms);
         return;
     }
     if (status_code == 200)
@@ -315,4 +473,47 @@ void ThreadWorker::record(int status_code, double latency_ms, bool timed_out)
         ++counters_.counts[OTHER_ERR];
 
     counters_.record_latency(latency_ms);
+}
+
+static std::optional<double> extract_json_number(const std::string &json,
+                                                 const std::string &key)
+{
+    const std::regex re("\"" + key + "\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
+    std::smatch match;
+    if (!std::regex_search(json, match, re))
+        return std::nullopt;
+
+    try
+    {
+        return std::stod(match[1].str());
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
+static std::string extract_json_string(const std::string &json,
+                                       const std::string &key)
+{
+    const std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+    std::smatch match;
+    if (std::regex_search(json, match, re))
+        return match[1].str();
+    return "";
+}
+
+static std::string extract_json_scalar(const std::string &json,
+                                       const std::string &key)
+{
+    auto text = extract_json_string(json, key);
+    if (!text.empty())
+        return text;
+
+    const std::regex re("\"" + key + "\"\\s*:\\s*(-?[0-9]+)");
+    std::smatch match;
+    if (std::regex_search(json, match, re))
+        return match[1].str();
+
+    return "";
 }

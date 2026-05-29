@@ -10,12 +10,13 @@
 #include <memory>
 #include <vector>
 #include "thread_worker.hpp"
-#include "telemetry.hpp"
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
 namespace http = beast::http;
 using tcp = asio::ip::tcp;
+
+class GrpcTelemetryClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FleetCommander — HTTP server that receives the start signal
@@ -28,22 +29,26 @@ using tcp = asio::ip::tcp;
 //   4. Spawns one ThreadWorker per core
 //   5. Waits for duration to expire
 //   6. Stops all workers cleanly
+//
+// Owns a long-lived GrpcTelemetryClient (channel opened once at startup).
 // ─────────────────────────────────────────────────────────────────────────────
 class FleetCommander
 {
 public:
     explicit FleetCommander(uint16_t listen_port,
-                            std::string telemetry_ingester_host,
-                            std::string telemetry_ingester_port);
+                            const std::string &grpc_target);
 
     // Blocking — runs the HTTP server forever
     void run();
 
 private:
     uint16_t listen_port_;
-    std::string telemetry_ingester_host_;
-    std::string telemetry_ingester_port_;
+    std::string grpc_target_;
     asio::io_context ioc_;
+
+    // Long-lived gRPC channel to the Go telemetry ingester.
+    // Created once at startup. Thread-safe. Shared across all benchmarks.
+    std::shared_ptr<GrpcTelemetryClient> grpc_client_;
 
     // Handle one incoming HTTP connection
     asio::awaitable<void> handle_connection(tcp::socket socket);
