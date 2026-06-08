@@ -1,6 +1,6 @@
-# Veltrix (IICPC) - Distributed Benchmarking Platform
+# Veltrix - Distributed Benchmarking Platform
 
-Veltrix is a distributed benchmarking platform for high-frequency trading engines built for the IICPC Summer Hackathon 2026. It securely hosts untrusted submissions, drives deterministic load with a C++ bot fleet, aggregates telemetry with event-time correctness checks, and streams a live leaderboard.
+Veltrix is a distributed benchmarking platform for high-frequency trading engines. It securely hosts untrusted submissions, drives deterministic load with a C++ bot fleet, aggregates telemetry with event-time correctness checks, and streams a live leaderboard.
 
 This repository is organized as a monorepo. The production services live under [veltrix/](veltrix/).
 
