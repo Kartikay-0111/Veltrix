@@ -10,7 +10,7 @@
 
 ## Architecture
 
-- Internal architecture: FastAPI app with asyncpg, Redis client, and boto3 S3 client.
+- Internal architecture: Go web service using standard library `net/http`, `pgxpool`, `redis/go-redis`, and `minio-go`.
 - Request flow:
      1. `POST /submit` streams multipart upload to MinIO.
      2. Insert submission metadata into Postgres.
@@ -26,8 +26,10 @@
 ```
 submission-service/
 ├── Dockerfile
-├── main.py          # FastAPI app, storage, and queueing
-└── requirements.txt
+├── cmd/             # main entrypoint
+├── internal/        # handlers, storage, config
+├── go.mod
+└── go.sum
 ```
 
 ## API Documentation
@@ -86,7 +88,5 @@ Environment variables (loaded via `.env`):
 ## Running Locally
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8080
+go run ./
 ```
-
-FastAPI docs are available at `/docs` when running locally.

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"sort"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -52,6 +53,14 @@ func fetchCurrentLeaderboard(ctx context.Context, pool *pgxpool.Pool) ([]MetricM
 		}
 		metrics = append(metrics, m)
 	}
+
+	// Sort by TPS descending, then by P99 ascending
+	sort.Slice(metrics, func(i, j int) bool {
+		if metrics[i].TPS == metrics[j].TPS {
+			return metrics[i].P99Ms < metrics[j].P99Ms
+		}
+		return metrics[i].TPS > metrics[j].TPS
+	})
 
 	return metrics, nil
 }

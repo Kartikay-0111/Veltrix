@@ -37,25 +37,25 @@ docker compose down
 
 ## Running Individual Services
 
-### Submission Service (FastAPI)
+### Submission Service
 
 ```bash
 cd veltrix/submission-service
-uvicorn main:app --host 0.0.0.0 --port 8080
+go run ./
 ```
 
 ### Sandbox Manager
 
 ```bash
 cd veltrix/sandbox-manager
-python main.py
+go run ./cmd/sandbox-manager
 ```
 
 ### Bot Fleet
 
 ```bash
 cd veltrix
-./bot-fleet/build/bot_fleet
+make bot-fleet-local
 ```
 
 ### Telemetry Ingester
@@ -68,7 +68,7 @@ go run ./...
 ### Artifact Checker
 
 ```bash
-cd veltrix/artifact-checker-go
+cd veltrix/artifact-checker
 go run ./cmd/artifact-checker
 ```
 

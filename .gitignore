@@ -91,6 +91,7 @@ htmlcov/
 *.orig
 .vscode-server/
 .history/
+.env
 .env.local
 .env.*.local
 
@@ -118,3 +119,6 @@ local-config/
 # .env.production
 # .env.secret
 # secrets/
+
+veltrix_real_capture.md
+veltrix_system_flow.md

@@ -5,8 +5,7 @@ Welcome to Veltrix. This guide provides the minimum steps to be productive on da
 ## Prerequisites
 
 - Docker + docker-compose
-- Python 3.12
-- Go 1.22+
+- Go 1.21+
 - C++20 toolchain (for bot-fleet or sample submissions)
 
 ## Quick Start
@@ -14,7 +13,7 @@ Welcome to Veltrix. This guide provides the minimum steps to be productive on da
 1. Clone the repo and create your env file:
 
 ```bash
-cp .env.example veltrix/.env
+cp veltrix/.env.example veltrix/.env
 ```
 
 2. Run the full stack:
@@ -32,11 +31,11 @@ open http://localhost:8085
 
 ## Key Entry Points
 
-- Submission Service: [veltrix/submission-service/main.py](veltrix/submission-service/main.py)
-- Sandbox Manager: [veltrix/sandbox-manager/main.py](veltrix/sandbox-manager/main.py)
+- Submission Service: [veltrix/submission-service/cmd/main.go](veltrix/submission-service/cmd/main.go)
+- Sandbox Manager: [veltrix/sandbox-manager/cmd/main.go](veltrix/sandbox-manager/cmd/main.go)
 - Bot Fleet: [veltrix/bot-fleet/src/fleet_commander.cpp](veltrix/bot-fleet/src/fleet_commander.cpp)
 - Telemetry Ingester: [veltrix/telemetry-ingester/main.go](veltrix/telemetry-ingester/main.go)
-- Artifact Checker: [veltrix/artifact-checker-go/cmd/artifact-checker/main.go](veltrix/artifact-checker-go/cmd/artifact-checker/main.go)
+- Artifact Checker: [veltrix/artifact-checker/cmd/artifact-checker/main.go](veltrix/artifact-checker/cmd/artifact-checker/main.go)
 - Leaderboard Service: [veltrix/leaderboard-service/main.go](veltrix/leaderboard-service/main.go)
 
 ## Debugging Tips

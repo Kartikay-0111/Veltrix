@@ -192,7 +192,7 @@
                             <th>Correct</th>
                         </tr>
                     </thead>
-                    <tbody id="leaderboard-body">
+                    <tbody id="leaderboard-body" hx-get="/leaderboard" hx-trigger="load">
                         <!-- Rows are injected here by HTMX OOB swaps -->
                         <tr id="empty-row">
                             <td colspan="7">

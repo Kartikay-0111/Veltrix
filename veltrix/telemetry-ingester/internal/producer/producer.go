@@ -30,7 +30,7 @@ type Producer struct {
 }
 
 // OrderEventJSON is the JSON shape consumed by the Go artifact-checker.
-// It matches the models.OrderEvent struct in artifact-checker-go.
+// It matches the models.OrderEvent struct in artifact-checker.
 type OrderEventJSON struct {
 	SubmissionID   string  `json:"submission_id"`
 	EventTimestamp int64   `json:"event_timestamp"`
@@ -86,11 +86,15 @@ func New(cfg Config) (*Producer, error) {
 // OrderEvent records and publishes them to the order_events topic.
 func (p *Producer) PublishOrderEvents(ctx context.Context, orders []*pb.OrderSubmitted) {
 	for _, order := range orders {
+		action := order.Action
+		if action != "CANCEL" {
+			action = order.Side
+		}
 		event := OrderEventJSON{
 			SubmissionID:   order.SubmissionId,
 			EventTimestamp: order.TimestampUs,
 			OrderID:        order.OrderId,
-			Action:         order.Action,
+			Action:         action,
 			Price:          order.Price,
 			Volume:         int(order.Quantity),
 		}

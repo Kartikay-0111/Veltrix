@@ -158,7 +158,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Send current leaderboard state immediately to this new client
 	go func() {
-		metrics, err := fetchCurrentLeaderboard(r.Context(), dbPool)
+		metrics, err := fetchCurrentLeaderboard(context.Background(), dbPool)
 		if err != nil {
 			log.Printf("[WS] Initial fetch error: %v", err)
 			return

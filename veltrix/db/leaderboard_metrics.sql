@@ -1,8 +1,8 @@
--- ─────────────────────────────────────────────────────────────────────────────
---  Part 3 Addition: Leaderboard Metrics (TimescaleDB hypertable)
--- ─────────────────────────────────────────────────────────────────────────────
+-- db/leaderboard_metrics.sql
+-- Plain PostgreSQL table — TimescaleDB hypertable removed.
+-- All metadata and leaderboard time-series now live in vanilla Postgres.
 CREATE TABLE IF NOT EXISTS leaderboard_metrics (
-    time            TIMESTAMPTZ NOT NULL,
+    time            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     team_id         VARCHAR(50)  NOT NULL,
     tps             INTEGER,
     p50_latency_ms  REAL,
@@ -11,11 +11,6 @@ CREATE TABLE IF NOT EXISTS leaderboard_metrics (
     is_correct      BOOLEAN
 );
 
-SELECT create_hypertable(
-    'leaderboard_metrics', 'time',
-    chunk_time_interval => INTERVAL '1 hour',
-    if_not_exists => TRUE
-);
-
+-- BRIN index is efficient for append-heavy time-series on plain Postgres.
 CREATE INDEX IF NOT EXISTS idx_metrics_team_time
     ON leaderboard_metrics(team_id, time DESC);

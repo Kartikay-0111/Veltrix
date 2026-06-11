@@ -13,10 +13,8 @@ This guide covers local setup only. It does not include production deployments.
 Minimum versions recommended for local development:
 
 - Docker Engine 24+ and docker-compose v2
-- Python 3.12 (for running services outside Docker)
 - Go 1.22+ (for running Go services outside Docker)
-- C++20 toolchain (for building the bot-fleet or contestant submissions locally)
-- PostgreSQL client tooling (optional, for debugging)
+- C++20 toolchain (for building the bot-fleet locally)
 
 ## Repository Layout
 
@@ -34,7 +32,7 @@ cd iicpc
 2. Create a local environment file for docker-compose:
 
 ```bash
-cp .env.example veltrix/.env
+cp veltrix/.env.example veltrix/.env
 ```
 
 3. Start infrastructure and services (build once):
@@ -55,7 +53,7 @@ curl http://localhost:7070/health
 
 ## Environment Variables
 
-This project uses a single `.env` file loaded by docker-compose. The example below is in `.env.example`.
+This project uses a single `.env` file loaded by docker-compose. The example below is in `veltrix/.env.example`.
 
 ### Core Infrastructure
 
@@ -106,24 +104,18 @@ Run services outside Docker if needed.
 ```bash
 # Submission service
 cd veltrix/submission-service
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8080
+go run ./
 
 # Sandbox manager
 cd veltrix/sandbox-manager
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python main.py
+go run ./cmd/sandbox-manager
 
 # Telemetry ingester
 cd veltrix/telemetry-ingester
 go run ./...
 
 # Artifact checker
-cd veltrix/artifact-checker-go
+cd veltrix/artifact-checker
 go run ./cmd/artifact-checker
 
 # Leaderboard

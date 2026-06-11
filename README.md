@@ -38,10 +38,10 @@ flowchart LR
 
 ## Tech Stack
 
-- Python 3.12 (submission-service, sandbox-manager)
+- Go (submission-service, sandbox-manager)
 - C++20 with Boost.Asio io_uring (bot-fleet)
 - Go (telemetry-ingester, artifact-checker, leaderboard-service)
-- PostgreSQL + TimescaleDB (metadata, leaderboard metrics)
+- PostgreSQL (metadata, leaderboard metrics)
 - Redis (queues, leaderboard cache/pubsub)
 - MinIO (submission artifacts)
 - Redpanda (Kafka-compatible event bus)
@@ -55,14 +55,14 @@ flowchart LR
 | Sandbox Manager | [veltrix/sandbox-manager](veltrix/sandbox-manager) | Builds and runs contestant sandboxes, triggers benchmarks. | 8081 (health) |
 | Bot Fleet | [veltrix/bot-fleet](veltrix/bot-fleet) | High-concurrency load generator with gRPC telemetry. | 7070 |
 | Telemetry Ingester | [veltrix/telemetry-ingester](veltrix/telemetry-ingester) | Accepts gRPC telemetry, publishes to Redpanda. | 8090, 8091 |
-| Artifact Checker | [veltrix/artifact-checker-go](veltrix/artifact-checker-go) | Reorders events, validates correctness, aggregates metrics. | 8092 (health) |
+| Artifact Checker | [veltrix/artifact-checker](veltrix/artifact-checker) | Reorders events, validates correctness, aggregates metrics. | 8092 (health) |
 | Leaderboard Service | [veltrix/leaderboard-service](veltrix/leaderboard-service) | Web UI + WebSocket broadcaster for live rankings. | 8085 |
 
 ## Repository Layout
 
 ```
 .
-├── veltrix/                 # All microservices and docker-compose
+├── veltrix/                 # All microservices
 ├── docs/                    # Onboarding and technical debt docs
 ├── SETUP.md
 ├── RUNNING.md

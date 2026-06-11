@@ -2,37 +2,39 @@
 
 ## System Overview
 
-Veltrix is a distributed benchmarking platform for contestant trading engines. It safely ingests untrusted submissions, compiles and runs them in isolated sandboxes, drives load with a C++ bot fleet, validates correctness in event-time order, and publishes a live leaderboard.
+Veltrix is a distributed benchmarking platform for contestant trading engines. It safely ingests untrusted submissions, compiles and runs them in isolated sandboxes, drives load with a high-performance C++ bot fleet, validates correctness in event-time order, and publishes a live leaderboard.
 
 ```mermaid
 flowchart LR
-  subgraph Ingest
-    A[Submission Service]
-    B[MinIO]
-    C[(Postgres)]
-    D[Redis Queue]
+  subgraph "Control Plane (Go)"
+    A[Submission Service\nGo · :8080]
+    E[Sandbox Manager\nGo · :8081\nBounded Worker Pool]
   end
-  subgraph Execution
-    E[Sandbox Manager]
-    F[Sandbox Container]
-    G[Bot Fleet]
+  subgraph "Storage"
+    B[(MinIO\nObject Store)]
+    C[(PostgreSQL\nAll metadata + metrics)]
+    D[(Redis\nQueue + Pub/Sub)]
   end
-  subgraph Telemetry
-    H[gRPC Telemetry Ingester]
-    I[Redpanda Topics]
-    J[Artifact Checker]
+  subgraph "Execution"
+    F[Sandbox Container\nContestant Code]
+    G[Bot Fleet\nC++20 · :7070]
   end
-  subgraph Leaderboard
-    K[Redis Leaderboard]
-    L[Leaderboard Service]
+  subgraph "Telemetry"
+    H[gRPC Ingester\nGo · :8090/:8091]
+    I[(Redpanda\norder_events\norder_metrics)]
+    J[Artifact Checker\nGo · :8092]
+  end
+  subgraph "Leaderboard"
+    K[(Redis\nleaderboard_state)]
+    L[Leaderboard Service\nGo · :8085]
   end
 
   A --> B
   A --> C
   A --> D
-  D --> E
-  E --> F
-  E --> G
+  D -->|BLPOP| E
+  E -->|Docker SDK| F
+  E -->|Redis Pub/Sub\nbot_fleet_triggers| G
   G --> H
   H --> I
   I --> J
@@ -48,131 +50,169 @@ flowchart LR
 ```mermaid
 sequenceDiagram
   participant Team
-  participant Submission
+  participant Submission as Submission Service (Go)
   participant MinIO
   participant Postgres
   participant Redis
-  participant Sandbox
-  Team->>Submission: POST /submit (archive + x-api-key)
-  Submission->>MinIO: multipart upload
-  Submission->>Postgres: insert submissions row (PENDING)
+  participant Sandbox as Sandbox Manager (Go)
+  participant Docker
+  participant Fleet as Bot Fleet (C++)
+
+  Team->>Submission: POST /submit (zip + X-API-Key)
+  Submission->>MinIO: stream upload (no buffering to disk)
+  Submission->>Postgres: INSERT submissions (PENDING)
   Submission->>Redis: RPUSH submission_queue
-  Sandbox->>Redis: BLPOP submission_queue
+  Note right of Submission: HTTP 202 returned immediately
+
+  Sandbox->>Redis: BLPOP submission_queue (dispatcher goroutine)
+  Note right of Sandbox: Job pushed to bounded channel (capacity = workerCount)
   Sandbox->>MinIO: download archive
-  Sandbox->>Sandbox: build Docker image and run container
-  Sandbox->>Postgres: update status READY / FAILED_*
+  Sandbox->>Sandbox: safe extract (zip/tar, path & size limits)
+  Sandbox->>Docker: ImageBuild (10m context timeout)
+  Sandbox->>Postgres: UPDATE status → BUILDING
+  Sandbox->>Docker: ContainerCreate + ContainerStart
+  Sandbox->>Sandbox: TCP probe port 9999 (15s timeout)
+  Sandbox->>Postgres: UPDATE status → READY
+  Sandbox->>Redis: PUBLISH bot_fleet_triggers (JSON payload)
+  Sandbox->>Postgres: UPDATE status → RUNNING
 ```
 
 ### Benchmark and Telemetry
 
 ```mermaid
 sequenceDiagram
-  participant Sandbox
-  participant Fleet
-  participant Contestant
-  participant Ingester
+  participant Fleet as Bot Fleet (C++)
+  participant Contestant as Contestant Container
+  participant Ingester as Telemetry Ingester (Go)
   participant Redpanda
-  participant Checker
+  participant Checker as Artifact Checker (Go)
   participant Redis
-  participant Leaderboard
-  Sandbox->>Fleet: POST /benchmark {target_host, target_port, bots, duration}
-  Fleet->>Contestant: REST order traffic
-  Fleet->>Ingester: gRPC StreamTelemetry (AuditBatch)
-  Ingester->>Redpanda: publish order_events + order_metrics
-  Checker->>Redpanda: consume events
-  Checker->>Checker: reorder by watermark + validate correctness
+  participant Leaderboard as Leaderboard Service (Go)
+  participant Postgres
+
+  Fleet->>Contestant: REST order traffic (io_uring)
+  Fleet->>Ingester: gRPC StreamTelemetry (AuditBatch · gzip)
+  Ingester->>Redpanda: produce order_events + order_metrics
+  Checker->>Redpanda: consume (franz-go consumer group)
+  Checker->>Checker: watermark reorder + shadow engine validation
   Checker->>Redis: HSET leaderboard_state + PUBLISH leaderboard_updates
-  Checker->>Postgres: insert leaderboard_metrics
-  Redis->>Leaderboard: Pub/Sub updates
+  Checker->>Postgres: INSERT leaderboard_metrics
+  Redis->>Leaderboard: Pub/Sub update
+  Leaderboard->>Leaderboard: broadcast via WebSocket
 ```
 
 ## Service Architecture Details
 
-### Submission Service (Python, FastAPI)
+### Submission Service (Go)
 
-- Responsibility: authenticate submissions, stream archives to object storage, enqueue sandbox jobs.
-- Internal layers:
-  - API handlers: `/submit`, `/submission/{id}`, `/health`.
-  - Storage adapter: MinIO S3 client for multipart streaming.
-  - Persistence: asyncpg for `teams` and `submissions`.
-  - Queueing: Redis list `submission_queue`.
-- Data flow: incoming multipart upload -> MinIO -> Postgres row -> Redis queue.
-- Error handling: invalid API keys (401), invalid language (400), storage exceptions (500).
+- **Language**: Go 1.21, stdlib `net/http`
+- **Responsibility**: authenticate submissions, stream archives to MinIO, enqueue sandbox jobs.
+- **Internal packages**:
+  - `internal/config` — env-driven config with fast-fail on missing required vars.
+  - `internal/db` — `pgxpool`-backed PostgreSQL client for `teams` and `submissions`.
+  - `internal/storage` — native `minio-go` client; uploads stream directly without buffering to disk.
+  - `internal/queue` — Redis client wrapping `RPUSH`/`BLPOP`/`PUBLISH`.
+  - `internal/handler` — HTTP handlers for `/submit`, `/submission/{id}`, `/health`.
+- **Data flow**: multipart upload → MinIO → Postgres row → Redis `RPUSH` → HTTP 202.
 
-### Sandbox Manager (Python worker)
+### Sandbox Manager (Go) — Bounded Worker Pool
 
-- Responsibility: build/run sandboxes, enforce resource limits, trigger benchmarks, update statuses.
-- Internal layers:
-  - Job poller: BLPOP on `submission_queue`.
-  - Safe extraction: zip/tar validation, size limits, no symlinks.
-  - Docker build/run: create image and run container on `sandbox-net`.
-  - Health probe: TCP port check and failure mapping.
-  - Fleet trigger: POST `/benchmark` to bot-fleet.
-- Failure modes: `FAILED_STARTUP`, `FAILED_RESOURCE`, `FAILED_LOGIC`, `FAILED_SYSTEM`.
+- **Language**: Go 1.21
+- **Architecture**: Bounded Worker Pool via goroutines and channels.
+  - One **dispatcher** goroutine owns all `BLPOP` calls and pushes IDs into a buffered `jobs` channel.
+  - `CONFIG_WORKER_COUNT` (default: 10) **worker** goroutines read from the channel concurrently.
+  - Channel capacity = workerCount → natural **back-pressure**: dispatcher blocks when all workers are busy. No goroutine explosion.
+- **Internal packages**:
+  - `internal/config` — config with `CONFIG_WORKER_COUNT` for pool sizing.
+  - `internal/db` — `pgxpool` client for submission state machine.
+  - `internal/storage` — MinIO download client.
+  - `internal/archive` — safe zip/tar extractor (path traversal, symlink, size, and count guards).
+  - `internal/docker` — Docker SDK wrapper with 10-minute build timeout, TCP startup probe, container lifecycle.
+  - `internal/worker` — dispatcher + pool logic.
+- **Fleet trigger**: Redis `PUBLISH` to `bot_fleet_triggers` (replaces HTTP `POST /benchmark`).
+- **Failure modes**: `FAILED_STARTUP`, `FAILED_RESOURCE`, `FAILED_LOGIC`, `FAILED_SYSTEM`.
 
 ### Bot Fleet (C++20, Boost.Asio io_uring)
 
-- Responsibility: generate load, capture intent/observations, stream telemetry batches.
-- Internal layers:
-  - FleetCommander: HTTP entrypoint `/benchmark`, spawns per-core workers.
+- **Responsibility**: generate load, capture audit events, stream telemetry.
+- **Trigger**: subscribes to Redis `bot_fleet_triggers` Pub/Sub channel (no HTTP dependency).
+- **Internal layers**:
+  - FleetCommander: Redis subscriber + benchmark launcher.
   - ThreadWorker: one OS thread per core, io_uring event loop.
-  - RestBot: request generator, tracks order IDs for cancel flows.
-  - gRPC client: streams `AuditBatch` to the telemetry ingester.
-- Data flow: raw HTTP -> parse response -> create order/trade events -> gRPC.
+  - GrpcTelemetryClient: streams `AuditBatch` every 500ms.
+- **Data flow**: REST → parse response → `OrderSubmitted`/`TradeExecuted` events → gRPC.
 
 ### Telemetry Ingester (Go)
 
-- Responsibility: ingest gRPC telemetry and publish to Redpanda.
-- Internal layers:
-  - gRPC `StreamTelemetry` handler.
-  - Redpanda producer (franz-go).
-  - HTTP health endpoints (`/health`, `/metrics/latest`).
-- Data flow: AuditBatch -> split into order events + metrics -> Redpanda topics.
+- **Responsibility**: receive gRPC telemetry and publish to Redpanda.
+- **Internal packages**: `internal/grpcserver`, `internal/producer`, `internal/pb` (protobuf codegen).
+- **Data flow**: `AuditBatch` (gzip) → order events + metrics → Redpanda topics.
 
 ### Artifact Checker (Go)
 
-- Responsibility: reorder events, validate correctness, aggregate metrics, publish leaderboard state.
-- Internal layers:
-  - Consumer: franz-go for order_events + order_metrics.
-  - Watermark router: per-submission event-time reordering.
-  - Shadow engine: price-time validation, emits correctness updates.
-  - Aggregator: merges latency histograms into p50/p90/p99.
-  - Publisher: Redis + TimescaleDB.
+- **Responsibility**: reorder events, validate correctness, publish leaderboard state.
+- **Publisher targets**: Redis (leaderboard state/pubsub) + **PostgreSQL** `leaderboard_metrics`.
 
 ### Leaderboard Service (Go)
 
-- Responsibility: render live leaderboard and broadcast updates.
-- Internal layers:
-  - Redis subscriber: converts JSON payloads to HTML rows.
-  - Hub: WebSocket connection registry and broadcast loop.
-  - HTTP handlers: `/`, `/leaderboard`, `/ws/leaderboard`, `/health`.
+- **Responsibility**: render live leaderboard via WebSocket.
+- **Data sources**: Redis Pub/Sub + PostgreSQL for historical metrics.
 
-## Data Stores and Topics
+## Data Stores
 
-### PostgreSQL / TimescaleDB
+### PostgreSQL
 
-- `teams`: API keys and team identity.
-- `submissions`: submission lifecycle and sandbox endpoint.
-- `benchmark_jobs`: persisted benchmark config history.
-- `leaderboard_metrics`: time-series leaderboard snapshots (TimescaleDB hypertable).
+PostgreSQL is the **single database** for all persistence. 
+
+| Table | Purpose |
+|---|---|
+| `teams` | API keys and team identity |
+| `submissions` | Submission lifecycle, sandbox endpoint, status codes |
+| `benchmark_jobs` | Persisted benchmark config history |
+| `leaderboard_metrics` | Time-series leaderboard snapshots (plain table, BRIN-friendly index) |
 
 ### Redis
 
-- `submission_queue` (list): sandbox job queue.
-- `leaderboard_state` (hash): last known score per submission.
-- `leaderboard_updates` (pubsub): live leaderboard updates.
+| Key | Type | Owner |
+|---|---|---|
+| `submission_queue` | List (FIFO) | Submission → Sandbox Manager |
+| `bot_fleet_triggers` | Pub/Sub channel | Sandbox Manager → Bot Fleet |
+| `leaderboard_state` | Hash | Artifact Checker |
+| `leaderboard_updates` | Pub/Sub channel | Artifact Checker → Leaderboard Service |
 
-### Redpanda
+### MinIO (S3-compatible)
 
-- `order_events`: order intent/trade events (JSON).
-- `order_metrics`: latency counters/histograms (JSON).
+- Bucket `submissions`: raw contestant zip archives.
+
+### Redpanda (Kafka-compatible)
+
+| Topic | Schema | Producer | Consumer |
+|---|---|---|---|
+| `order_events` | JSON `OrderEventJSON` | Telemetry Ingester | Artifact Checker |
+| `order_metrics` | JSON `MetricsJSON` | Telemetry Ingester | Artifact Checker |
 
 ## Error Handling and Resilience
 
-- Sandbox failures are mapped to deterministic status codes to separate contestant errors from platform issues.
-- Telemetry ingestion uses buffered channels and async Redpanda producer to avoid blocking the bot fleet.
-- The leaderboard service recovers from Redis by reading the latest TimescaleDB metrics on connect.
+- Sandbox failures map to deterministic codes (`FAILED_*`) to separate contestant bugs from platform faults.
+- The worker pool provides back-pressure: if all 10 workers are busy, the dispatcher goroutine blocks — preventing unbounded memory growth under job spikes.
+- Build timeouts (10 minutes) ensure a stuck contestant Dockerfile cannot permanently hold a worker.
+- Telemetry uses buffered channels and async Redpanda producer to prevent the bot fleet from blocking.
+- The leaderboard service can recover leaderboard state from PostgreSQL on restart.
 
 ## Local Deployment Topology
 
-Local development runs all services via docker-compose in [veltrix/docker-compose.yml](veltrix/docker-compose.yml). Each service reads from the shared `.env` file in [veltrix/.env](veltrix/.env).
+All services run via `docker compose` in [veltrix/docker-compose.yml](veltrix/docker-compose.yml). Configuration is read from [veltrix/.env](veltrix/.env).
+
+```
+localhost:8080  → Submission Service
+localhost:8081  → Sandbox Manager (health)
+localhost:8085  → Leaderboard Service
+localhost:8090  → Telemetry Ingester (HTTP health/metrics)
+localhost:8091  → Telemetry Ingester (gRPC)
+localhost:8092  → Artifact Checker (health)
+localhost:9000  → MinIO S3 API
+localhost:9001  → MinIO Console
+localhost:5432  → PostgreSQL
+localhost:6379  → Redis
+localhost:9092  → Redpanda (Kafka)
+```

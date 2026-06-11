@@ -6,7 +6,7 @@
 - Business responsibility: translate submissions into runnable containers and update lifecycle state.
 - Key workflows: dequeue job, build image, run container, health probe, trigger bot fleet, cleanup.
 - Dependencies: Postgres, Redis, MinIO, Docker Engine, Bot Fleet.
-- External integrations: Docker Engine API, HTTP call to bot-fleet.
+- External integrations: Docker Engine API, Redis Pub/Sub call to bot-fleet.
 
 ## Architecture
 
@@ -15,7 +15,7 @@
         - Safe archive extraction (zip/tar validation, size limits, no symlinks).
         - Docker build and run with strict resource limits.
         - Port readiness probe (TCP connect).
-        - Fleet trigger via `POST /benchmark`.
+        - Fleet trigger via Redis channel `bot_fleet_triggers`.
 - Request flow:
         1. Read submission ID from Redis.
         2. Download archive from MinIO.
@@ -30,8 +30,10 @@
 ```
 sandbox-manager/
 ├── Dockerfile
-├── main.py          # Job poller, build/run logic, cleanup
-└── requirements.txt
+├── cmd/             # Entrypoint
+├── internal/        # Worker pool, Docker integration, extraction
+├── go.mod
+└── go.sum
 ```
 
 ## API Documentation
@@ -56,7 +58,7 @@ Environment variables (loaded via `.env`):
 ## Running Locally
 
 ```bash
-python main.py
+go run ./cmd/sandbox-manager
 ```
 
 ## Security and Isolation Notes
