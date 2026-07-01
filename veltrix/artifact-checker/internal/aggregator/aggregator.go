@@ -2,6 +2,7 @@ package aggregator
 
 import (
 	"context"
+	"log"
 	"math"
 	"time"
 
@@ -24,6 +25,7 @@ var BucketUpperBoundsMs = []float64{
 // per submission per flush interval.
 type Aggregator struct {
 	FlushInterval time.Duration
+	Logger        *log.Logger
 	states        map[string]*submissionState
 }
 
@@ -45,6 +47,7 @@ func New(flushInterval time.Duration) *Aggregator {
 
 	return &Aggregator{
 		FlushInterval: flushInterval,
+		Logger:        log.Default(),
 		states:        make(map[string]*submissionState),
 	}
 }
@@ -133,6 +136,11 @@ func (aggregator *Aggregator) Flush(ctx context.Context, out chan<- models.Score
 			P99Ms:        PercentileMs(state.histogram, 99),
 			P99Bucket:    PercentileBucketIndex(state.histogram, 99),
 			Correct:      state.correct,
+		}
+
+		if logger := aggregator.Logger; logger != nil {
+			logger.Printf("[aggregator] flush submission=%s tps=%d p50=%.3fms p90=%.3fms p99=%.3fms correct=%t",
+				score.SubmissionID, score.TPS, score.P50Ms, score.P90Ms, score.P99Ms, score.Correct)
 		}
 
 		if err := send(ctx, out, score); err != nil {

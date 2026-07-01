@@ -21,6 +21,11 @@ type OrderEvent struct {
 	// engine uses these to catch "worse than top-of-book" and FIFO violations.
 	MatchedOrderID string  `json:"matched_order_id,omitempty"`
 	ExecutionPrice float64 `json:"execution_price,omitempty"`
+
+	// AggressorOrderID is the bot-generated order_id of the aggressing order that
+	// produced this fill. It is the join key tying a FILL event back to the
+	// OrderSubmitted intent that caused it. Only present on FILL events.
+	AggressorOrderID string `json:"aggressor_order_id,omitempty"`
 }
 
 func (event *OrderEvent) UnmarshalJSON(data []byte) error {
@@ -32,9 +37,10 @@ func (event *OrderEvent) UnmarshalJSON(data []byte) error {
 		Action         string  `json:"action"`
 		Price          float64 `json:"price"`
 		Volume         int     `json:"volume"`
-		Quantity       int     `json:"quantity"`
-		MatchedOrderID string  `json:"matched_order_id"`
-		ExecutionPrice float64 `json:"execution_price"`
+		Quantity         int     `json:"quantity"`
+		MatchedOrderID   string  `json:"matched_order_id"`
+		ExecutionPrice   float64 `json:"execution_price"`
+		AggressorOrderID string  `json:"aggressor_order_id"`
 	}
 
 	var decoded orderEventJSON
@@ -53,6 +59,7 @@ func (event *OrderEvent) UnmarshalJSON(data []byte) error {
 	}
 	event.MatchedOrderID = decoded.MatchedOrderID
 	event.ExecutionPrice = decoded.ExecutionPrice
+	event.AggressorOrderID = decoded.AggressorOrderID
 
 	return nil
 }

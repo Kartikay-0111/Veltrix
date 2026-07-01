@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	docker "github.com/fsouza/go-dockerclient"
@@ -177,7 +178,7 @@ func (c *Client) RemoveContainer(ctx context.Context, containerID, imageTag stri
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func waitForPort(host string, port int, timeout time.Duration) bool {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)

@@ -33,6 +33,7 @@ type TradeExecuted struct {
 	ExecutionPrice     float64 `protobuf:"fixed64,6,opt,name=execution_price,json=executionPrice,proto3" json:"execution_price,omitempty"`
 	ExecutionQuantity  int32   `protobuf:"varint,7,opt,name=execution_quantity,json=executionQuantity,proto3" json:"execution_quantity,omitempty"`
 	Ticker             string  `protobuf:"bytes,8,opt,name=ticker,proto3" json:"ticker,omitempty"`
+	AggressorOrderId   string  `protobuf:"bytes,9,opt,name=aggressor_order_id,json=aggressorOrderId,proto3" json:"aggressor_order_id,omitempty"`
 }
 
 // MetricsBatch is the aggregated latency/throughput metrics from one thread.

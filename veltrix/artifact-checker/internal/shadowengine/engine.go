@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 
 	"veltrix/artifact-checker/internal/models"
@@ -12,10 +14,36 @@ import (
 // Engine consumes watermark-ordered events and validates each submission on one
 // goroutine. No mutex is used in the hot path; sequential channel delivery is
 // the synchronization boundary.
+//
+// Validation model
+// ────────────────
+// The bot emits two kinds of events per submission, both keyed by the
+// bot-generated order_id:
+//
+//   - Intents  (Action = BUY | SELL | CANCEL): what the bot asked the
+//     contestant's exchange to do. These build a reference order book.
+//   - Fills    (Action = FILL): what the contestant's engine actually did,
+//     carrying the AggressorOrderID join key back to the intent that caused it.
+//
+// A fill is validated against its own intent:
+//
+//   - Limit-price bound (sound, ordering-independent): a BUY must not execute
+//     above its limit; a SELL must not execute below its limit.
+//   - Volume conservation (sound, ordering-independent): the cumulative filled
+//     quantity attributed to an order (as the aggressor) must not exceed the
+//     quantity it submitted.
+//
+// These two checks never touch the order book and hold under full concurrent
+// load. A third, price-time priority check ("executed worse than top of book")
+// does depend on event-time ordering — which under concurrent multi-bot load is
+// not the server's true arrival order — so it is gated behind
+// STRICT_PRICE_TIME_PRIORITY and defaults off to avoid failing correct
+// submissions. It is intended for deterministic / single-bot grading.
 type Engine struct {
-	books  map[string]*orderBook
-	states map[string]validationState
-	logger *log.Logger
+	subs           map[string]*submission
+	states         map[string]validationState
+	logger         *log.Logger
+	strictPriority bool
 }
 
 type validationState struct {
@@ -23,16 +51,51 @@ type validationState struct {
 	reason  string
 }
 
+// submission holds the per-submission validation context.
+type submission struct {
+	book           *orderBook
+	intents        map[string]*intent // aggressor (bot) order_id -> intent
+	filled         map[string]int     // aggressor (bot) order_id -> cumulative filled qty
+	fillsValidated int                // count of fills checked against an intent
+}
+
+// intent captures the aggressor information a fill is validated against.
+type intent struct {
+	side         string  // BUY | SELL
+	limitPrice   float64 // limit price (0 for MARKET)
+	market       bool    // MARKET order (no limit bound)
+	submittedQty int     // quantity the bot asked for
+	bestOpposing float64 // best opposing price in the book when this intent arrived
+	hasOpposing  bool    // whether bestOpposing is meaningful
+}
+
 func New(logger *log.Logger) *Engine {
 	if logger == nil {
 		logger = log.Default()
 	}
 
-	return &Engine{
-		books:  make(map[string]*orderBook),
-		states: make(map[string]validationState),
-		logger: logger,
+	engine := &Engine{
+		subs:           make(map[string]*submission),
+		states:         make(map[string]validationState),
+		logger:         logger,
+		strictPriority: strictPriorityFromEnv(),
 	}
+	logger.Printf("[shadowengine] ready (strict price-time priority: %t)", engine.strictPriority)
+	return engine
+}
+
+// strictPriorityFromEnv reads STRICT_PRICE_TIME_PRIORITY. The priority check is
+// reliable only under deterministic grading, so it is opt-in.
+func strictPriorityFromEnv() bool {
+	raw := strings.TrimSpace(os.Getenv("STRICT_PRICE_TIME_PRIORITY"))
+	if raw == "" {
+		return false
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false
+	}
+	return enabled
 }
 
 // Run consumes globally routed, per-submission ordered events and emits an
@@ -79,13 +142,13 @@ func (engine *Engine) Apply(event models.OrderEvent) (models.CorrectnessUpdate, 
 		return models.CorrectnessUpdate{SubmissionID: submissionID, IsCorrect: false, Reason: state.reason}, false
 	}
 
-	book := engine.books[submissionID]
-	if book == nil {
-		book = newOrderBook()
-		engine.books[submissionID] = book
+	sub := engine.subs[submissionID]
+	if sub == nil {
+		sub = newSubmission()
+		engine.subs[submissionID] = sub
 	}
 
-	if err := book.apply(event); err != nil {
+	if err := engine.process(sub, event); err != nil {
 		engine.states[submissionID] = validationState{correct: false, reason: err.Error()}
 		engine.logger.Printf("[shadowengine] submission=%s incorrect: %v", submissionID, err)
 		return models.CorrectnessUpdate{
@@ -98,9 +161,154 @@ func (engine *Engine) Apply(event models.OrderEvent) (models.CorrectnessUpdate, 
 	return models.CorrectnessUpdate{SubmissionID: submissionID, IsCorrect: true}, false
 }
 
+// process routes one event to the intent replay path or the fill validation
+// path. A returned error means the submission is incorrect.
+func (engine *Engine) process(sub *submission, event models.OrderEvent) error {
+	action := strings.ToUpper(strings.TrimSpace(event.Action))
+	switch action {
+	case "BUY", "SELL":
+		return sub.onAggressorIntent(action, event)
+	case "CANCEL":
+		return sub.book.applyCancel(event)
+	case "FILL":
+		return engine.validateFill(sub, event)
+	default:
+		return fmt.Errorf("unknown action %q for order_id=%s", event.Action, event.OrderID)
+	}
+}
+
 func (engine *Engine) IsCorrect(submissionID string) bool {
 	state, ok := engine.states[submissionID]
 	return !ok || state.correct
+}
+
+func newSubmission() *submission {
+	return &submission{
+		book:    newOrderBook(),
+		intents: make(map[string]*intent),
+		filled:  make(map[string]int),
+	}
+}
+
+// onAggressorIntent records a BUY/SELL intent and replays it into the reference
+// book. The book is used only by the (gated) price-time priority check; the
+// sound limit/volume checks rely only on the recorded intent.
+func (s *submission) onAggressorIntent(side string, event models.OrderEvent) error {
+	if err := validateNewOrder(event); err != nil {
+		return err
+	}
+	if _, exists := s.book.liveOrderIDs[event.OrderID]; exists {
+		return fmt.Errorf("duplicate live order_id=%s", event.OrderID)
+	}
+
+	market := event.Price <= 0
+
+	// Capture the best opposing price BEFORE matching consumes liquidity, so the
+	// priority check can compare a fill against the top of book the aggressor saw.
+	bestOpposing, hasOpposing := 0.0, false
+	if side == "BUY" {
+		if len(s.book.asks) > 0 {
+			bestOpposing, hasOpposing = s.book.asks[0].price, true
+		}
+	} else { // SELL
+		if len(s.book.bids) > 0 {
+			bestOpposing, hasOpposing = s.book.bids[0].price, true
+		}
+	}
+
+	s.intents[event.OrderID] = &intent{
+		side:         side,
+		limitPrice:   event.Price,
+		market:       market,
+		submittedQty: event.Volume,
+		bestOpposing: bestOpposing,
+		hasOpposing:  hasOpposing,
+	}
+
+	if side == "BUY" {
+		s.book.applyBuy(event)
+	} else {
+		s.book.applySell(event)
+	}
+	return nil
+}
+
+// validateFill checks one contestant-reported fill against the intent that
+// produced it (joined via AggressorOrderID).
+func (engine *Engine) validateFill(sub *submission, event models.OrderEvent) error {
+	if event.Volume <= 0 {
+		return fmt.Errorf("fill with non-positive quantity=%d (aggressor_order_id=%s)", event.Volume, event.AggressorOrderID)
+	}
+
+	agg, ok := sub.intents[event.AggressorOrderID]
+	if !ok {
+		// No matching intent — most likely a telemetry gap (e.g. the intent was
+		// dropped, or a cancel/market edge case). Tolerate rather than risk a
+		// false negative; there is nothing trustworthy to validate against.
+		engine.logger.Printf("[shadowengine] submission=%s fill for unknown aggressor_order_id=%s (tolerated)",
+			event.SubmissionID, event.AggressorOrderID)
+		return nil
+	}
+
+	if sub.fillsValidated == 0 {
+		engine.logger.Printf("[shadowengine] submission=%s validating fills against intents (first fill: aggressor_order_id=%s)",
+			event.SubmissionID, event.AggressorOrderID)
+	}
+	sub.fillsValidated++
+
+	// ── Volume conservation (sound, ordering-independent) ─────────────────────
+	sub.filled[event.AggressorOrderID] += event.Volume
+	if sub.filled[event.AggressorOrderID] > agg.submittedQty {
+		return fmt.Errorf(
+			"over-fill: order_id=%s filled %d > submitted %d",
+			event.AggressorOrderID, sub.filled[event.AggressorOrderID], agg.submittedQty,
+		)
+	}
+
+	// ── Limit-price bound (sound, ordering-independent) ───────────────────────
+	// MARKET orders have no limit, so skip the bound for them.
+	if !agg.market {
+		switch agg.side {
+		case "BUY":
+			if event.ExecutionPrice > agg.limitPrice {
+				return fmt.Errorf(
+					"buy order_id=%s executed at %.6f above its limit %.6f",
+					event.AggressorOrderID, event.ExecutionPrice, agg.limitPrice,
+				)
+			}
+		case "SELL":
+			if event.ExecutionPrice < agg.limitPrice {
+				return fmt.Errorf(
+					"sell order_id=%s executed at %.6f below its limit %.6f",
+					event.AggressorOrderID, event.ExecutionPrice, agg.limitPrice,
+				)
+			}
+		}
+	}
+
+	// ── Price-time priority (gated, default off) ──────────────────────────────
+	// Reliable only under deterministic grading; see type doc. Compares the fill
+	// against the top of book the aggressor saw on arrival.
+	if engine.strictPriority && agg.hasOpposing && event.ExecutionPrice > 0 {
+		switch agg.side {
+		case "BUY":
+			if event.ExecutionPrice > agg.bestOpposing {
+				return fmt.Errorf(
+					"buy order_id=%s executed at %.6f worse than top-of-book ask %.6f",
+					event.AggressorOrderID, event.ExecutionPrice, agg.bestOpposing,
+				)
+			}
+		case "SELL":
+			if event.ExecutionPrice < agg.bestOpposing {
+				return fmt.Errorf(
+					"sell order_id=%s executed at %.6f worse than top-of-book bid %.6f",
+					event.AggressorOrderID, event.ExecutionPrice, agg.bestOpposing,
+				)
+			}
+		}
+	}
+
+	return nil
 }
 
 type orderBook struct {
@@ -128,41 +336,11 @@ func newOrderBook() *orderBook {
 	}
 }
 
-func (book *orderBook) apply(event models.OrderEvent) error {
-	action := strings.ToUpper(strings.TrimSpace(event.Action))
-	switch action {
-	case "BUY":
-		return book.applyBuy(event)
-	case "SELL":
-		return book.applySell(event)
-	case "CANCEL":
-		return book.applyCancel(event)
-	case "FILL":
-		return nil
-	default:
-		return fmt.Errorf("unknown action %q for order_id=%s", event.Action, event.OrderID)
-	}
-}
-
-func (book *orderBook) applyBuy(event models.OrderEvent) error {
-	if err := validateNewOrder(event); err != nil {
-		return err
-	}
-	if _, exists := book.liveOrderIDs[event.OrderID]; exists {
-		return fmt.Errorf("duplicate live order_id=%s", event.OrderID)
-	}
-
+func (book *orderBook) applyBuy(event models.OrderEvent) {
 	market := event.Price <= 0 // MARKET order: sweep all available asks
 
 	remaining := event.Volume
-	checkedExternalMatch := false
 	for remaining > 0 && len(book.asks) > 0 && (market || book.asks[0].price <= event.Price) {
-		if !checkedExternalMatch {
-			if err := book.validateExpectedMatch("BUY", event, book.asks[0].orders[0]); err != nil {
-				return err
-			}
-			checkedExternalMatch = true
-		}
 		remaining = book.fillBestAsk(remaining)
 	}
 
@@ -176,29 +354,13 @@ func (book *orderBook) applyBuy(event models.OrderEvent) error {
 		})
 		book.nextSequence++
 	}
-
-	return nil
 }
 
-func (book *orderBook) applySell(event models.OrderEvent) error {
-	if err := validateNewOrder(event); err != nil {
-		return err
-	}
-	if _, exists := book.liveOrderIDs[event.OrderID]; exists {
-		return fmt.Errorf("duplicate live order_id=%s", event.OrderID)
-	}
-
+func (book *orderBook) applySell(event models.OrderEvent) {
 	market := event.Price <= 0 // MARKET order: sweep all available bids
 
 	remaining := event.Volume
-	checkedExternalMatch := false
 	for remaining > 0 && len(book.bids) > 0 && (market || book.bids[0].price >= event.Price) {
-		if !checkedExternalMatch {
-			if err := book.validateExpectedMatch("SELL", event, book.bids[0].orders[0]); err != nil {
-				return err
-			}
-			checkedExternalMatch = true
-		}
 		remaining = book.fillBestBid(remaining)
 	}
 
@@ -212,19 +374,16 @@ func (book *orderBook) applySell(event models.OrderEvent) error {
 		})
 		book.nextSequence++
 	}
-
-	return nil
 }
 
 func (book *orderBook) applyCancel(event models.OrderEvent) error {
 	if event.OrderID == "" {
 		return fmt.Errorf("cancel without order_id")
 	}
-	if !book.removeLiveOrder(event.OrderID) {
-		// Tolerate cancel for unknown order ID due to telemetry protocol mapping limitations
-		return nil
-	}
-
+	// Tolerate cancel for an unknown order ID: the bot's cancel carries the
+	// server-assigned ID, which does not exist in this bot-ID-keyed reference
+	// book. This is a known telemetry-mapping limitation, not a contestant error.
+	book.removeLiveOrder(event.OrderID)
 	return nil
 }
 
@@ -238,45 +397,6 @@ func validateNewOrder(event models.OrderEvent) error {
 	// Price=0 is valid for MARKET orders — skip price check in that case.
 	if event.Price < 0 {
 		return fmt.Errorf("negative price=%.6f for order_id=%s", event.Price, event.OrderID)
-	}
-
-	return nil
-}
-
-func (book *orderBook) validateExpectedMatch(side string, event models.OrderEvent, best restingOrder) error {
-	if event.MatchedOrderID != "" && event.MatchedOrderID != best.id {
-		return fmt.Errorf(
-			"%s order_id=%s skipped older/better resting order_id=%s and matched order_id=%s",
-			side,
-			event.OrderID,
-			best.id,
-			event.MatchedOrderID,
-		)
-	}
-
-	if event.ExecutionPrice <= 0 {
-		return nil
-	}
-
-	switch side {
-	case "BUY":
-		if event.ExecutionPrice > best.price {
-			return fmt.Errorf(
-				"buy order_id=%s executed at %.6f worse than best ask %.6f",
-				event.OrderID,
-				event.ExecutionPrice,
-				best.price,
-			)
-		}
-	case "SELL":
-		if event.ExecutionPrice < best.price {
-			return fmt.Errorf(
-				"sell order_id=%s executed at %.6f worse than best bid %.6f",
-				event.OrderID,
-				event.ExecutionPrice,
-				best.price,
-			)
-		}
 	}
 
 	return nil

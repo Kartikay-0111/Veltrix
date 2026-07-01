@@ -71,6 +71,7 @@ bool GrpcTelemetryClient::send_batch(
         pb_trade->set_execution_price(trade.execution_price);
         pb_trade->set_execution_quantity(trade.execution_quantity);
         pb_trade->set_ticker(trade.ticker);
+        pb_trade->set_aggressor_order_id(trade.aggressor_order_id);
     }
 
     // ── Pack MetricsBatch ────────────────────────────────────────────────────

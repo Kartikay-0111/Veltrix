@@ -26,15 +26,6 @@ CREATE TABLE submissions (
     updated_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE benchmark_jobs (
-    id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    submission_id UUID REFERENCES submissions(id) ON DELETE CASCADE,
-    status        TEXT NOT NULL DEFAULT 'QUEUED',  -- QUEUED|RUNNING|COMPLETED|FAILED
-    num_bots      INT DEFAULT 100,
-    duration_secs INT DEFAULT 60,
-    created_at    TIMESTAMPTZ DEFAULT NOW()
-);
-
 -- Seed a test team so you can test immediately
 INSERT INTO teams (name, email, api_key)
 VALUES ('Test Team', 'test@iicpc.dev', 'test-api-key-1234')

@@ -87,6 +87,7 @@ func main() {
 
 	shadow := shadowengine.New(logger)
 	metricsAggregator := aggregator.New(10 * time.Second)
+	metricsAggregator.Logger = logger
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

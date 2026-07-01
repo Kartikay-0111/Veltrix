@@ -40,6 +40,7 @@ type OrderEventJSON struct {
 	Volume         int     `json:"volume"`
 	MatchedOrderID string  `json:"matched_order_id,omitempty"`
 	ExecutionPrice float64 `json:"execution_price,omitempty"`
+	AggressorOrderID string `json:"aggressor_order_id,omitempty"`
 }
 
 // MetricsJSON is the JSON shape consumed by the Go artifact-checker aggregator.
@@ -114,13 +115,14 @@ func (p *Producer) PublishOrderEvents(ctx context.Context, orders []*pb.OrderSub
 func (p *Producer) PublishTradeEvents(ctx context.Context, trades []*pb.TradeExecuted) {
 	for _, trade := range trades {
 		event := OrderEventJSON{
-			SubmissionID:   trade.SubmissionId,
-			EventTimestamp: trade.TimestampUs,
-			OrderID:        fmt.Sprintf("%d", trade.ContestantOrderId),
-			Action:         "FILL",
-			MatchedOrderID: fmt.Sprintf("%d", trade.MatchedOrderId),
-			ExecutionPrice: trade.ExecutionPrice,
-			Volume:         int(trade.ExecutionQuantity),
+			SubmissionID:     trade.SubmissionId,
+			EventTimestamp:   trade.TimestampUs,
+			OrderID:          fmt.Sprintf("%d", trade.ContestantOrderId),
+			Action:           "FILL",
+			MatchedOrderID:   fmt.Sprintf("%d", trade.MatchedOrderId),
+			ExecutionPrice:   trade.ExecutionPrice,
+			Volume:           int(trade.ExecutionQuantity),
+			AggressorOrderID: trade.AggressorOrderId,
 		}
 
 		data, err := json.Marshal(event)

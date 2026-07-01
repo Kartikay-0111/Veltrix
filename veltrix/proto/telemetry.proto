@@ -32,6 +32,11 @@ message TradeExecuted {
   double execution_price     = 6;
   int32  execution_quantity  = 7;
   string ticker              = 8;
+  string aggressor_order_id  = 9;  // Bot-generated order_id of the aggressing order
+                                   // (the intent that produced this fill). This is the
+                                   // join key the Shadow Engine uses to tie a fill back
+                                   // to its OrderSubmitted intent — bot-assigned, so the
+                                   // contestant server can neither forge nor evade it.
 }
 
 // ─── Metrics ─────────────────────────────────────────────────────────────────

@@ -1,6 +1,4 @@
 -- db/leaderboard_metrics.sql
--- Plain PostgreSQL table — TimescaleDB hypertable removed.
--- All metadata and leaderboard time-series now live in vanilla Postgres.
 CREATE TABLE IF NOT EXISTS leaderboard_metrics (
     time            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     team_id         VARCHAR(50)  NOT NULL,

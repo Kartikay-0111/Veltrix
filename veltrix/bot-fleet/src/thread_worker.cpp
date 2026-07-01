@@ -272,7 +272,7 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
 
             if (timed_out)
             {
-                record(0, 1000.0, true); // penalise timeout as 1s
+                record(0, 0.0, true); // count as TIMEOUT only — not a latency sample
                 continue;
             }
 
@@ -346,7 +346,8 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
                         contestant_order_id,
                         matched_id,
                         trade.price,
-                        trade.qty);
+                        trade.qty,
+                        last.order_id); // join key: bot-generated aggressor order_id
                 }
 
                 // Feed server-assigned order IDs back to the bot for cancel flow
@@ -459,8 +460,10 @@ void ThreadWorker::record(int status_code, double latency_ms, bool timed_out)
 {
     if (timed_out)
     {
+        // A timeout is an error, not a served request. Count it in the TIMEOUT
+        // bucket only — do NOT feed it into the latency histogram, or percentiles
+        // would be dominated by timeout penalties instead of real served latency.
         ++counters_.counts[TIMEOUT];
-        counters_.record_latency(latency_ms);
         return;
     }
     if (status_code == 200)

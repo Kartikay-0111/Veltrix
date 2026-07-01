@@ -4,6 +4,7 @@ package archive
 import (
 	"archive/tar"
 	"archive/zip"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
@@ -109,7 +110,19 @@ func extractTar(archivePath, destDir string, l Limits) error {
 	}
 	defer f.Close()
 
-	tr := tar.NewReader(f)
+	// Transparently decompress gzip-wrapped tarballs (.tar.gz), which the
+	// submission contract documents as the expected format. A gzip stream starts
+	// with magic bytes 0x1f 0x8b; without this the raw gzip bytes would be fed to
+	// the tar reader and fail with "invalid tar header".
+	var src io.Reader = f
+	if gz, gzErr := gzip.NewReader(f); gzErr == nil {
+		defer gz.Close()
+		src = gz
+	} else if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+		return fmt.Errorf("rewind archive after gzip probe: %w", seekErr)
+	}
+
+	tr := tar.NewReader(src)
 	var totalBytes int64
 	fileCount := 0
 
