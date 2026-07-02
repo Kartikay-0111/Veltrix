@@ -115,6 +115,7 @@ void FleetCommander::launch_benchmark(const BenchmarkConfig &cfg)
 
     std::cout << "[FleetCommander] Launching benchmark:\n"
               << "  submission_id : " << cfg.submission_id << "\n"
+              << "  mode          : " << cfg.mode << "\n"
               << "  target        : " << cfg.target_host << ":" << cfg.target_port << "\n"
               << "  total bots    : " << cfg.num_bots << "\n"
               << "  cores         : " << num_cores << "\n"
@@ -164,9 +165,25 @@ BenchmarkConfig FleetCommander::parse_benchmark_request(const std::string &body)
     cfg.protocol = extract_json_string(body, "protocol");
     cfg.num_bots = extract_json_int(body, "num_bots");
     cfg.duration_secs = extract_json_int(body, "duration_secs");
+    cfg.mode = extract_json_string(body, "mode");
+    cfg.seed = static_cast<uint64_t>(extract_json_int(body, "seed"));
 
-    if (cfg.num_bots <= 0)
+    if (cfg.mode.empty())
+        cfg.mode = "performance";
+
+    if (cfg.mode == "correctness")
+    {
+        // Serialized single writer: exactly one bot so send-order == the
+        // contestant's process-order == the seq the golden model replays.
+        cfg.num_bots = 1;
+        if (cfg.seed == 0)
+            cfg.seed = 42; // deterministic default so every contestant gets the same stream
+    }
+    else if (cfg.num_bots <= 0)
+    {
         cfg.num_bots = 1000;
+    }
+
     if (cfg.duration_secs <= 0)
         cfg.duration_secs = 60;
     if (cfg.protocol.empty())

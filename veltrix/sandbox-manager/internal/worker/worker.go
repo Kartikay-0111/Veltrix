@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"veltrix/sandbox-manager/internal/archive"
@@ -39,8 +40,13 @@ import (
 )
 
 const (
-	submissionQueue    = "submission_queue"
-	botFleetTrigger    = "bot_fleet_triggers" // Redis Pub/Sub channel
+	submissionQueue = "submission_queue"
+	botFleetTrigger = "bot_fleet_triggers" // Redis Pub/Sub channel
+
+	// benchmarkPhaseGapSecs is the pause between the correctness phase ending and
+	// the performance phase starting, leaving room for the run to stop, flush the
+	// end-of-run marker, and let the checker finalize the verdict.
+	benchmarkPhaseGapSecs = 15
 )
 
 // Pool is the bounded worker pool.
@@ -51,7 +57,13 @@ type Pool struct {
 	docker  *dockerpkg.Client
 	redis   *redis.Client
 	jobs    chan string // buffered by workerCount — this is the back-pressure valve
-	logger  *log.Logger
+	// benchGate serializes benchmark runs across submissions. The bot-fleet is a
+	// single shared service that pins one worker per CPU core, so two overlapping
+	// runs fight for the same cores and pollute each other's latency numbers. A
+	// slot is held for a run's whole span (correctness + gap + performance); its
+	// capacity is MaxConcurrentBenchmarks (default 1 = fully serialized).
+	benchGate chan struct{}
+	logger    *log.Logger
 }
 
 // New creates the pool. Call Run() to start dispatching.
@@ -63,14 +75,19 @@ func New(
 	rdb *redis.Client,
 	logger *log.Logger,
 ) *Pool {
+	maxBench := cfg.MaxConcurrentBenchmarks
+	if maxBench < 1 {
+		maxBench = 1
+	}
 	return &Pool{
-		cfg:     cfg,
-		db:      db,
-		storage: store,
-		docker:  dockerCli,
-		redis:   rdb,
-		jobs:    make(chan string, cfg.WorkerCount),
-		logger:  logger,
+		cfg:       cfg,
+		db:        db,
+		storage:   store,
+		docker:    dockerCli,
+		redis:     rdb,
+		jobs:      make(chan string, cfg.WorkerCount),
+		benchGate: make(chan struct{}, maxBench),
+		logger:    logger,
 	}
 }
 
@@ -193,7 +210,9 @@ func (p *Pool) process(ctx context.Context, submissionID string) {
 	_ = p.db.UpdateStatus(ctx, submissionID, "RUNNING", nil)
 
 	// ── 5. Schedule cleanup after the benchmark window ────────────────────────
-	cleanupDelay := time.Duration(p.cfg.DefaultDurationSecs+300) * time.Second
+	// Cover both phases: correctness + gap + performance, then a grace window.
+	cleanupDelay := time.Duration(
+		p.cfg.CorrectnessDurationSecs+benchmarkPhaseGapSecs+p.cfg.DefaultDurationSecs+300) * time.Second
 	go func() {
 		p.logger.Printf("[process:%s] cleanup scheduled in %s", submissionID, cleanupDelay)
 		time.Sleep(cleanupDelay)
@@ -264,31 +283,89 @@ func (p *Pool) buildImage(ctx context.Context, sub *db.Submission, imageTag stri
 // channel and sends an HTTP POST request to the C++ FleetCommander service
 // listening on http://bot-fleet:7070/benchmark.
 func (p *Pool) triggerBotFleet(ctx context.Context, submissionID, targetHost string) error {
-	payload := map[string]any{
-		"submission_id":  submissionID,
-		"target_host":    targetHost,
-		"target_port":    fmt.Sprintf("%d", dockerpkg.SandboxPort),
-		"num_bots":       p.cfg.DefaultNumBots,
-		"duration_secs":  p.cfg.DefaultDurationSecs,
-		"protocol":       "rest",
+	targetPort := fmt.Sprintf("%d", dockerpkg.SandboxPort)
+
+	// ── Serialize benchmark runs on the shared bot-fleet ──────────────────────
+	// Acquire a slot before triggering and hold it for the whole run (correctness
+	// + gap + performance), so two submissions never load the fleet concurrently
+	// and contend for the same pinned CPU cores. Blocks here (back-pressure) until
+	// a slot frees; released by the deferred performance goroutine below.
+	select {
+	case p.benchGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+	var gateOnce sync.Once
+	releaseGate := func() { gateOnce.Do(func() { <-p.benchGate }) }
+
+	// ── Phase 1: correctness (serialized golden-model differential replay) ────
+	// One bot, fixed seed, full audit → the artifact-checker replays this exact
+	// ordered stream through the golden model and emits the correctness verdict.
+	correctness := map[string]any{
+		"submission_id": submissionID,
+		"target_host":   targetHost,
+		"target_port":   targetPort,
+		"protocol":      "rest",
+		"mode":          "correctness",
+		"num_bots":      1,
+		"seed":          p.cfg.CorrectnessSeed,
+		"duration_secs": p.cfg.CorrectnessDurationSecs,
+	}
+	if err := p.postBenchmark(ctx, submissionID, correctness); err != nil {
+		releaseGate()
+		return err
+	}
+	p.logger.Printf("[trigger:%s] correctness phase started (seed=%d, %ds)",
+		submissionID, p.cfg.CorrectnessSeed, p.cfg.CorrectnessDurationSecs)
+
+	// ── Phase 2: performance (concurrent load) — after the correctness phase ──
+	// Metrics only; drives latency/throughput. Deferred so the two phases never
+	// hit the contestant concurrently (which would break serialized ordering).
+	// This goroutine owns the benchmark slot and releases it only after the
+	// performance run has run its course, so the next submission's benchmark
+	// cannot start on the shared fleet until this one is fully done.
+	go func() {
+		defer releaseGate()
+		time.Sleep(time.Duration(p.cfg.CorrectnessDurationSecs+benchmarkPhaseGapSecs) * time.Second)
+		perf := map[string]any{
+			"submission_id": submissionID,
+			"target_host":   targetHost,
+			"target_port":   targetPort,
+			"protocol":      "rest",
+			"mode":          "performance",
+			"num_bots":      p.cfg.DefaultNumBots,
+			"duration_secs": p.cfg.DefaultDurationSecs,
+		}
+		if err := p.postBenchmark(context.Background(), submissionID, perf); err != nil {
+			p.logger.Printf("[trigger:%s] performance phase trigger failed: %v", submissionID, err)
+			return
+		}
+		p.logger.Printf("[trigger:%s] performance phase started (%d bots, %ds)",
+			submissionID, p.cfg.DefaultNumBots, p.cfg.DefaultDurationSecs)
+		// Hold the benchmark slot until the performance run finishes (the fleet
+		// runs it asynchronously after returning 202), then release for the next.
+		time.Sleep(time.Duration(p.cfg.DefaultDurationSecs) * time.Second)
+	}()
+
+	return nil
+}
+
+// postBenchmark publishes the trigger to Redis Pub/Sub and POSTs it to the C++
+// FleetCommander. FleetCommander returns immediately (202) and runs the run in a
+// detached thread, so callers must space phases out in time themselves.
+func (p *Pool) postBenchmark(ctx context.Context, submissionID string, payload map[string]any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal trigger payload: %w", err)
 	}
 
-	// 1. Publish to Redis Pub/Sub (for decoupled architectures/subscribers)
 	if err := p.redis.Publish(ctx, botFleetTrigger, string(data)).Err(); err != nil {
 		p.logger.Printf("[trigger] Redis publish failed (continuing to HTTP trigger): %v", err)
-	} else {
-		p.logger.Printf("[trigger] published benchmark for %s to channel %q", submissionID, botFleetTrigger)
 	}
 
-	// 2. Call the C++ FleetCommander via HTTP POST (direct trigger)
 	client := &http.Client{Timeout: 10 * time.Second}
-	reqURL := "http://bot-fleet:7070/benchmark"
-	
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://bot-fleet:7070/benchmark", bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("create HTTP request to bot-fleet: %w", err)
 	}
@@ -304,8 +381,6 @@ func (p *Pool) triggerBotFleet(ctx context.Context, submissionID, targetHost str
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("bot-fleet returned status %d: %s", resp.StatusCode, string(body))
 	}
-
-	p.logger.Printf("[trigger] HTTP request accepted by bot-fleet for submission %s", submissionID)
 	return nil
 }
 

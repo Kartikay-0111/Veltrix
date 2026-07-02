@@ -46,8 +46,14 @@ type leaderboardPayload struct {
 	P90Ms        float64 `json:"p90_ms"`
 	P99Ms        float64 `json:"p99_ms"`
 	P99Bucket    int     `json:"p99_bucket"`
-	Correct      bool    `json:"correct"`
-	IsCorrect    bool    `json:"is_correct"`
+	// Status is the full tri-state verdict: "correct" | "incorrect" | "unverified".
+	// Correct/IsCorrect are the legacy booleans (true only when Status=="correct"),
+	// kept so existing leaderboard consumers keep working; new consumers should read
+	// Status so they can distinguish "unverified" (never conclusively checked) from
+	// "incorrect" (a real matching bug).
+	Status    string `json:"status"`
+	Correct   bool   `json:"correct"`
+	IsCorrect bool   `json:"is_correct"`
 }
 
 func NewPublisher(ctx context.Context, config Config) (*Publisher, error) {
@@ -150,7 +156,7 @@ func (publisher *Publisher) insertTimescaleAsync(score models.Score) {
 			score.P50Ms,
 			score.P90Ms,
 			score.P99Ms,
-			score.Correct,
+			score.Verdict == models.VerdictCorrect,
 		)
 		if err != nil {
 			publisher.logger.Printf("[storage] TimescaleDB insert failed submission=%s: %v", score.SubmissionID, err)
@@ -180,6 +186,12 @@ func toPayload(score models.Score) leaderboardPayload {
 		teamName = score.SubmissionID
 	}
 
+	status := score.Verdict
+	if status == "" {
+		status = models.VerdictUnverified
+	}
+	correct := status == models.VerdictCorrect
+
 	return leaderboardPayload{
 		SubmissionID: score.SubmissionID,
 		TeamName:     teamName,
@@ -188,7 +200,8 @@ func toPayload(score models.Score) leaderboardPayload {
 		P90Ms:        score.P90Ms,
 		P99Ms:        score.P99Ms,
 		P99Bucket:    score.P99Bucket,
-		Correct:      score.Correct,
-		IsCorrect:    score.Correct,
+		Status:       string(status),
+		Correct:      correct,
+		IsCorrect:    correct,
 	}
 }

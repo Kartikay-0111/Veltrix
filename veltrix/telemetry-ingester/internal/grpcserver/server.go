@@ -39,7 +39,6 @@ func New(prod *producer.Producer, logger *log.Logger) *Server {
 // The C++ bot-fleet sends a stream of AuditBatch messages (one every 500ms
 // per thread). We process each batch inline and ack once when the stream ends.
 func (s *Server) StreamTelemetry(stream pb.TelemetryService_StreamTelemetryServer) error {
-	ctx := stream.Context()
 	var batchCount int64
 
 	for {
@@ -61,18 +60,21 @@ func (s *Server) StreamTelemetry(stream pb.TelemetryService_StreamTelemetryServe
 		s.batchesTotal.Add(1)
 
 		// ── Publish order events to Redpanda ─────────────────────────────
+		// NOTE: publishes are async and intentionally decoupled from this
+		// RPC's context — see Producer.bgCtx. Binding them to stream.Context()
+		// dropped the final batch (incl. the correctness END marker) on EOF.
 		if len(batch.Orders) > 0 {
-			s.producer.PublishOrderEvents(ctx, batch.Orders)
+			s.producer.PublishOrderEvents(batch.Orders)
 		}
 
 		// ── Publish trade events to Redpanda ─────────────────────────────
 		if len(batch.Trades) > 0 {
-			s.producer.PublishTradeEvents(ctx, batch.Trades)
+			s.producer.PublishTradeEvents(batch.Trades)
 		}
 
 		// ── Publish metrics to Redpanda ──────────────────────────────────
 		if batch.Metrics != nil {
-			s.producer.PublishMetrics(ctx, batch.Metrics)
+			s.producer.PublishMetrics(batch.Metrics)
 			s.storeLatestMetrics(batch.Metrics)
 		}
 

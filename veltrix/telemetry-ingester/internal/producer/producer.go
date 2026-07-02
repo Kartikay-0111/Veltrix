@@ -27,20 +27,34 @@ type Producer struct {
 	metricsTopic string
 	logger       *log.Logger
 	wg           sync.WaitGroup
+
+	// bgCtx bounds the async produce promises to the producer's own lifetime,
+	// NOT to any single gRPC stream. The durable write to Redpanda must outlive
+	// the ingest RPC: if we used the stream context, the last batch of a stream
+	// (which for a correctness run carries the END-of-run marker) would be
+	// canceled the instant the RPC returns and silently dropped. Close() waits
+	// on wg before closing the client, so pending produces still flush on exit.
+	bgCtx context.Context
 }
 
 // OrderEventJSON is the JSON shape consumed by the Go artifact-checker.
 // It matches the models.OrderEvent struct in artifact-checker.
 type OrderEventJSON struct {
-	SubmissionID   string  `json:"submission_id"`
-	EventTimestamp int64   `json:"event_timestamp"`
-	OrderID        string  `json:"order_id"`
-	Action         string  `json:"action"`
-	Price          float64 `json:"price"`
-	Volume         int     `json:"volume"`
-	MatchedOrderID string  `json:"matched_order_id,omitempty"`
-	ExecutionPrice float64 `json:"execution_price,omitempty"`
-	AggressorOrderID string `json:"aggressor_order_id,omitempty"`
+	SubmissionID      string  `json:"submission_id"`
+	EventTimestamp    int64   `json:"event_timestamp"`
+	OrderID           string  `json:"order_id"`
+	Action            string  `json:"action"`     // BUY | SELL | CANCEL | FILL (routing)
+	OrderType         string  `json:"order_type,omitempty"` // LIMIT | MARKET | FOK | FAK | GFD
+	Ticker            string  `json:"ticker,omitempty"`
+	Price             float64 `json:"price"`
+	Volume            int     `json:"volume"`
+	Seq               uint64  `json:"seq,omitempty"`
+	ContestantOrderID uint64  `json:"contestant_order_id,omitempty"`
+	MatchedOrderID    uint64  `json:"matched_order_id,omitempty"`
+	CancelTargetID    uint64  `json:"cancel_target_id,omitempty"`
+	ExecutionPrice    float64 `json:"execution_price,omitempty"`
+	AggressorOrderID  string  `json:"aggressor_order_id,omitempty"`
+	EndOfRun          bool    `json:"end_of_run,omitempty"`
 }
 
 // MetricsJSON is the JSON shape consumed by the Go artifact-checker aggregator.
@@ -80,24 +94,34 @@ func New(cfg Config) (*Producer, error) {
 		orderTopic:   cfg.OrderTopic,
 		metricsTopic: cfg.MetricsTopic,
 		logger:       cfg.Logger,
+		bgCtx:        context.Background(),
 	}, nil
 }
 
 // PublishOrderEvents converts protobuf OrderSubmitted messages into JSON
 // OrderEvent records and publishes them to the order_events topic.
-func (p *Producer) PublishOrderEvents(ctx context.Context, orders []*pb.OrderSubmitted) {
+func (p *Producer) PublishOrderEvents(orders []*pb.OrderSubmitted) {
 	for _, order := range orders {
-		action := order.Action
-		if action != "CANCEL" {
-			action = order.Side
+		// order.Action carries the order type (LIMIT/MARKET/CANCEL/FOK/FAK/GFD).
+		// Action (routing) is the side, except for cancels.
+		orderType := order.Action
+		action := order.Side
+		if orderType == "CANCEL" {
+			action = "CANCEL"
 		}
 		event := OrderEventJSON{
-			SubmissionID:   order.SubmissionId,
-			EventTimestamp: order.TimestampUs,
-			OrderID:        order.OrderId,
-			Action:         action,
-			Price:          order.Price,
-			Volume:         int(order.Quantity),
+			SubmissionID:      order.SubmissionId,
+			EventTimestamp:    order.TimestampUs,
+			OrderID:           order.OrderId,
+			Action:            action,
+			OrderType:         orderType,
+			Ticker:            order.Ticker,
+			Price:             order.Price,
+			Volume:            int(order.Quantity),
+			Seq:               order.Seq,
+			ContestantOrderID: order.ContestantOrderId,
+			CancelTargetID:    order.CancelTargetId,
+			EndOfRun:          order.EndOfRun,
 		}
 
 		data, err := json.Marshal(event)
@@ -106,23 +130,26 @@ func (p *Producer) PublishOrderEvents(ctx context.Context, orders []*pb.OrderSub
 			continue
 		}
 
-		p.produce(ctx, p.orderTopic, order.SubmissionId, data)
+		p.produce(p.orderTopic, order.SubmissionId, data)
 	}
 }
 
 // PublishTradeEvents converts protobuf TradeExecuted messages into JSON
 // OrderEvent records (with execution fields) and publishes to order_events.
-func (p *Producer) PublishTradeEvents(ctx context.Context, trades []*pb.TradeExecuted) {
+func (p *Producer) PublishTradeEvents(trades []*pb.TradeExecuted) {
 	for _, trade := range trades {
 		event := OrderEventJSON{
-			SubmissionID:     trade.SubmissionId,
-			EventTimestamp:   trade.TimestampUs,
-			OrderID:          fmt.Sprintf("%d", trade.ContestantOrderId),
-			Action:           "FILL",
-			MatchedOrderID:   fmt.Sprintf("%d", trade.MatchedOrderId),
-			ExecutionPrice:   trade.ExecutionPrice,
-			Volume:           int(trade.ExecutionQuantity),
-			AggressorOrderID: trade.AggressorOrderId,
+			SubmissionID:      trade.SubmissionId,
+			EventTimestamp:    trade.TimestampUs,
+			OrderID:           fmt.Sprintf("%d", trade.ContestantOrderId),
+			Action:            "FILL",
+			Ticker:            trade.Ticker,
+			ContestantOrderID: trade.ContestantOrderId,
+			MatchedOrderID:    trade.MatchedOrderId,
+			ExecutionPrice:    trade.ExecutionPrice,
+			Volume:            int(trade.ExecutionQuantity),
+			AggressorOrderID:  trade.AggressorOrderId,
+			Seq:               trade.Seq,
 		}
 
 		data, err := json.Marshal(event)
@@ -131,13 +158,13 @@ func (p *Producer) PublishTradeEvents(ctx context.Context, trades []*pb.TradeExe
 			continue
 		}
 
-		p.produce(ctx, p.orderTopic, trade.SubmissionId, data)
+		p.produce(p.orderTopic, trade.SubmissionId, data)
 	}
 }
 
 // PublishMetrics converts a protobuf MetricsBatch into JSON and publishes
 // to the order_metrics topic.
-func (p *Producer) PublishMetrics(ctx context.Context, metrics *pb.MetricsBatch) {
+func (p *Producer) PublishMetrics(metrics *pb.MetricsBatch) {
 	if metrics == nil {
 		return
 	}
@@ -163,10 +190,10 @@ func (p *Producer) PublishMetrics(ctx context.Context, metrics *pb.MetricsBatch)
 		return
 	}
 
-	p.produce(ctx, p.metricsTopic, metrics.SubmissionId, data)
+	p.produce(p.metricsTopic, metrics.SubmissionId, data)
 }
 
-func (p *Producer) produce(ctx context.Context, topic, key string, value []byte) {
+func (p *Producer) produce(topic, key string, value []byte) {
 	record := &kgo.Record{
 		Topic: topic,
 		Key:   []byte(key),
@@ -174,7 +201,7 @@ func (p *Producer) produce(ctx context.Context, topic, key string, value []byte)
 	}
 
 	p.wg.Add(1)
-	p.client.Produce(ctx, record, func(_ *kgo.Record, err error) {
+	p.client.Produce(p.bgCtx, record, func(_ *kgo.Record, err error) {
 		defer p.wg.Done()
 		if err != nil {
 			p.logger.Printf("[producer] publish to %s failed: %v", topic, err)

@@ -541,7 +541,15 @@ public:
 
         OnOrderAdded(order);
 
-        return MatchOrders();
+        auto trades = MatchOrders();
+
+        // Standard MARKET semantics (see docs/matching-spec.md): a market order
+        // sweeps available liquidity and cancels any unfilled remainder rather
+        // than resting it in the book at the worst opposing price.
+        if (order->GetOrderType() == OrderType::Market && !order->IsFilled())
+            CancelOrderInternal(order->GetOrderId());
+
+        return trades;
     }
 
     void CancelOrder(OrderId orderId)

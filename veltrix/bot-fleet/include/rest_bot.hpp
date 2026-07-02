@@ -33,7 +33,8 @@ class RestBot : public BotPayload
 public:
     explicit RestBot(const std::string &host,
                      const std::string &port,
-                     uint64_t bot_id);
+                     uint64_t bot_id,
+                     uint64_t seed = 0); // seed != 0 → deterministic order stream
 
     // Implements BotPayload interface
     std::string generate_request() override;

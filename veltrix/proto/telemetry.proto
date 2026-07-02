@@ -17,6 +17,16 @@ message OrderSubmitted {
   double price            = 8;
   int32  quantity         = 9;
   uint64 cancel_target_id = 10; // For CANCEL: server-assigned ID being cancelled
+  uint64 seq              = 11; // Monotonic per-submission sequence stamped by the
+                                // serialized correctness-run writer. Defines the
+                                // exact order the golden model replays; also the
+                                // idempotency key for dedup.
+  uint64 contestant_order_id = 12; // Server-assigned ID the contestant returned for
+                                   // this order, captured post-response so the checker
+                                   // can map the server id namespace back to bot ids
+                                   // (for cancel replay and counterparty checks).
+  bool   end_of_run       = 13; // Sentinel: the serialized correctness run is complete;
+                                // the checker finalizes the verdict on this marker.
 }
 
 // ─── Event Type 2: Observation ───────────────────────────────────────────────
@@ -34,9 +44,11 @@ message TradeExecuted {
   string ticker              = 8;
   string aggressor_order_id  = 9;  // Bot-generated order_id of the aggressing order
                                    // (the intent that produced this fill). This is the
-                                   // join key the Shadow Engine uses to tie a fill back
-                                   // to its OrderSubmitted intent — bot-assigned, so the
+                                   // join key the checker uses to tie a fill back to its
+                                   // OrderSubmitted intent — bot-assigned, so the
                                    // contestant server can neither forge nor evade it.
+  uint64 seq                 = 10; // Monotonic per-submission sequence (same counter as
+                                   // OrderSubmitted.seq) — replay ordering + dedup key.
 }
 
 // ─── Metrics ─────────────────────────────────────────────────────────────────

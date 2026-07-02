@@ -37,7 +37,21 @@ type submissionState struct {
 	// Dynamic histogram: grows automatically to accommodate however many
 	// buckets the producer sends (the C++ bot currently sends 18).
 	histogram []int64
-	correct   bool
+
+	// verdict defaults to Unverified — never Correct. It only becomes
+	// Correct/Incorrect when the replay engine sends an explicit verdict. This is
+	// the fail-safe default: a submission that was never checked (or whose verdict
+	// was lost) must not silently read as a pass.
+	verdict models.Verdict
+
+	// Last-known computed metrics, so a verdict emitted outside a metrics flush
+	// (or with no perf metrics at all) still carries real percentiles rather than
+	// clobbering them with zeros.
+	lastTPS       int
+	lastP50       float64
+	lastP90       float64
+	lastP99       float64
+	lastP99Bucket int
 }
 
 func New(flushInterval time.Duration) *Aggregator {
@@ -79,6 +93,13 @@ func (aggregator *Aggregator) Run(
 				continue
 			}
 			aggregator.ApplyCorrectness(update)
+			// Emit the verdict immediately, decoupled from the metrics flush. The
+			// verdict must reach the leaderboard the moment it is decided; waiting
+			// for the next metrics flush would strand it whenever a submission has
+			// no new metrics that window — the fail-open propagation gap.
+			if err := aggregator.emitVerdict(ctx, out, update.SubmissionID); err != nil {
+				return err
+			}
 		case <-ticker.C:
 			if err := aggregator.Flush(ctx, out); err != nil {
 				return err
@@ -105,7 +126,37 @@ func (aggregator *Aggregator) ApplyCorrectness(update models.CorrectnessUpdate) 
 	}
 
 	state := aggregator.state(update.SubmissionID)
-	state.correct = update.IsCorrect
+	state.verdict = update.Verdict
+}
+
+// emitVerdict sends the current verdict for a submission right away, carrying the
+// last-known latency metrics (zero until the first metrics flush). This makes the
+// verdict reach the leaderboard when it is decided, independent of whether any
+// perf metrics arrive in the same window.
+func (aggregator *Aggregator) emitVerdict(ctx context.Context, out chan<- models.Score, submissionID string) error {
+	state := aggregator.state(submissionID)
+	score := aggregator.scoreFor(submissionID, state)
+	if logger := aggregator.Logger; logger != nil {
+		logger.Printf("[aggregator] verdict submission=%s verdict=%s (tps=%d p99=%.3fms)",
+			score.SubmissionID, score.Verdict, score.TPS, score.P99Ms)
+	}
+	return send(ctx, out, score)
+}
+
+// scoreFor builds a Score from a submission's current verdict and last-known
+// metrics. Used by both the metrics flush and the immediate verdict emit so the
+// two paths never disagree.
+func (aggregator *Aggregator) scoreFor(submissionID string, state *submissionState) models.Score {
+	return models.Score{
+		SubmissionID: submissionID,
+		TeamName:     submissionID,
+		TPS:          state.lastTPS,
+		P50Ms:        state.lastP50,
+		P90Ms:        state.lastP90,
+		P99Ms:        state.lastP99,
+		P99Bucket:    state.lastP99Bucket,
+		Verdict:      state.verdict,
+	}
 }
 
 func (aggregator *Aggregator) Flush(ctx context.Context, out chan<- models.Score) error {
@@ -126,21 +177,19 @@ func (aggregator *Aggregator) Flush(ctx context.Context, out chan<- models.Score
 
 		// Percentiles computed against the dynamic histogram using the known
 		// C++ bucket upper bounds. Any extra buckets beyond our bounds table
-		// are treated as the last known upper bound value.
-		score := models.Score{
-			SubmissionID: submissionID,
-			TeamName:     submissionID,
-			TPS:          tps,
-			P50Ms:        PercentileMs(state.histogram, 50),
-			P90Ms:        PercentileMs(state.histogram, 90),
-			P99Ms:        PercentileMs(state.histogram, 99),
-			P99Bucket:    PercentileBucketIndex(state.histogram, 99),
-			Correct:      state.correct,
-		}
+		// are treated as the last known upper bound value. Stored as last-known so
+		// a later verdict-only emit carries real percentiles, not zeros.
+		state.lastTPS = tps
+		state.lastP50 = PercentileMs(state.histogram, 50)
+		state.lastP90 = PercentileMs(state.histogram, 90)
+		state.lastP99 = PercentileMs(state.histogram, 99)
+		state.lastP99Bucket = PercentileBucketIndex(state.histogram, 99)
+
+		score := aggregator.scoreFor(submissionID, state)
 
 		if logger := aggregator.Logger; logger != nil {
-			logger.Printf("[aggregator] flush submission=%s tps=%d p50=%.3fms p90=%.3fms p99=%.3fms correct=%t",
-				score.SubmissionID, score.TPS, score.P50Ms, score.P90Ms, score.P99Ms, score.Correct)
+			logger.Printf("[aggregator] flush submission=%s tps=%d p50=%.3fms p90=%.3fms p99=%.3fms verdict=%s",
+				score.SubmissionID, score.TPS, score.P50Ms, score.P90Ms, score.P99Ms, score.Verdict)
 		}
 
 		if err := send(ctx, out, score); err != nil {
@@ -162,8 +211,9 @@ func (aggregator *Aggregator) state(submissionID string) *submissionState {
 	state := aggregator.states[submissionID]
 	if state == nil {
 		state = &submissionState{
-			correct:   true,
-			lastFlush: time.Now(),
+			verdict:       models.VerdictUnverified,
+			lastFlush:     time.Now(),
+			lastP99Bucket: -1, // -1 = no latency data yet (matches PercentileBucketIndex)
 		}
 		aggregator.states[submissionID] = state
 	}

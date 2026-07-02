@@ -9,10 +9,13 @@ This folder contains a reference submission that matches the sandbox contract.
 - Required binary name: `server`.
 - Required listen port: `9999`.
 - Required HTTP routes:
-  - `POST /order`
-  - `DELETE /order/{id}`
+  - `POST /order` — submit an order **and** cancels (`{"type":"cancel","order_id":<int>}`)
+  - `DELETE /order/{id}` — cancel by id (also accepted, but the grader cancels via `POST /order`)
   - `GET /book/{ticker}`
   - `GET /health`
+- Response shape is part of the contract — see `../docs/matching-spec.md`
+  ("Wire contract"). Accepted orders return **HTTP 200** with `order_id` +
+  `trades[]`; rejected/malformed requests return a non-2xx status.
 
 ## Build
 
@@ -27,5 +30,5 @@ cmake --build build
 - The server listens on port `9999`.
 - `GET /health` returns a status JSON response.
 - `GET /book/{ticker}` returns the current order book snapshot.
-- `POST /order` accepts order submissions.
-- `DELETE /order/{id}` cancels an existing order.
+- `POST /order` accepts order submissions and cancels (`{"type":"cancel","order_id":<int>}`).
+- `DELETE /order/{id}` also cancels an existing order.

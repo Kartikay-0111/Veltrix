@@ -57,6 +57,9 @@ bool GrpcTelemetryClient::send_batch(
         pb_order->set_price(order.price);
         pb_order->set_quantity(order.quantity);
         pb_order->set_cancel_target_id(order.cancel_target_id);
+        pb_order->set_seq(order.seq);
+        pb_order->set_contestant_order_id(order.contestant_order_id);
+        pb_order->set_end_of_run(order.end_of_run);
     }
 
     // ── Pack TradeExecuted events ────────────────────────────────────────────
@@ -72,6 +75,7 @@ bool GrpcTelemetryClient::send_batch(
         pb_trade->set_execution_quantity(trade.execution_quantity);
         pb_trade->set_ticker(trade.ticker);
         pb_trade->set_aggressor_order_id(trade.aggressor_order_id);
+        pb_trade->set_seq(trade.seq);
     }
 
     // ── Pack MetricsBatch ────────────────────────────────────────────────────

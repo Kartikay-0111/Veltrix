@@ -15,32 +15,62 @@ type OrderEvent struct {
 	Price          float64 `json:"price"`
 	Volume         int     `json:"volume"`
 
-	// Optional execution-log fields. The base architecture only requires the
-	// fields above, but real checker streams often include the resting order and
-	// execution price selected by the contestant engine. When present, the shadow
-	// engine uses these to catch "worse than top-of-book" and FIFO violations.
-	MatchedOrderID string  `json:"matched_order_id,omitempty"`
-	ExecutionPrice float64 `json:"execution_price,omitempty"`
+	// Ticker names the order book this event belongs to. The golden-model replay
+	// engine keeps one book per ticker, so this must be present on every intent
+	// and fill.
+	Ticker string `json:"ticker,omitempty"`
+
+	// OrderType is the matching semantic carried from the bot's intent:
+	// LIMIT | MARKET | FOK | FAK | GFD (CANCEL is signalled via Action). The
+	// producer historically overwrote this with the side; it is now carried
+	// explicitly because the golden model matches each type differently.
+	OrderType string `json:"order_type,omitempty"`
+
+	// Seq is a monotonic per-submission sequence number stamped by the single
+	// correctness-run writer at send time. It defines the exact order the golden
+	// model replays and doubles as the idempotency key for dedup.
+	Seq uint64 `json:"seq,omitempty"`
+
+	// Server-assigned identifiers. ContestantOrderID is the id the contestant
+	// engine assigned to this order (on an intent) or to the aggressor (on a
+	// fill); MatchedOrderID is the resting maker's server id (on a fill);
+	// CancelTargetID is the server id a CANCEL intent targets. These map the
+	// contestant's id namespace back to bot order_ids for counterparty checks
+	// and cancel replay.
+	ContestantOrderID uint64  `json:"contestant_order_id,omitempty"`
+	MatchedOrderID    uint64  `json:"matched_order_id,omitempty"`
+	CancelTargetID    uint64  `json:"cancel_target_id,omitempty"`
+	ExecutionPrice    float64 `json:"execution_price,omitempty"`
 
 	// AggressorOrderID is the bot-generated order_id of the aggressing order that
 	// produced this fill. It is the join key tying a FILL event back to the
 	// OrderSubmitted intent that caused it. Only present on FILL events.
 	AggressorOrderID string `json:"aggressor_order_id,omitempty"`
+
+	// EndOfRun marks the sentinel event the correctness-run writer emits when the
+	// serialized order stream is complete, letting the engine finalize the verdict.
+	EndOfRun bool `json:"end_of_run,omitempty"`
 }
 
 func (event *OrderEvent) UnmarshalJSON(data []byte) error {
 	type orderEventJSON struct {
-		SubmissionID   string  `json:"submission_id"`
-		EventTimestamp int64   `json:"event_timestamp"`
-		Timestamp      int64   `json:"timestamp"`
-		OrderID        string  `json:"order_id"`
-		Action         string  `json:"action"`
-		Price          float64 `json:"price"`
-		Volume         int     `json:"volume"`
-		Quantity         int     `json:"quantity"`
-		MatchedOrderID   string  `json:"matched_order_id"`
-		ExecutionPrice   float64 `json:"execution_price"`
-		AggressorOrderID string  `json:"aggressor_order_id"`
+		SubmissionID      string  `json:"submission_id"`
+		EventTimestamp    int64   `json:"event_timestamp"`
+		Timestamp         int64   `json:"timestamp"`
+		OrderID           string  `json:"order_id"`
+		Action            string  `json:"action"`
+		Price             float64 `json:"price"`
+		Volume            int     `json:"volume"`
+		Quantity          int     `json:"quantity"`
+		Ticker            string  `json:"ticker"`
+		OrderType         string  `json:"order_type"`
+		Seq               uint64  `json:"seq"`
+		ContestantOrderID uint64  `json:"contestant_order_id"`
+		MatchedOrderID    uint64  `json:"matched_order_id"`
+		CancelTargetID    uint64  `json:"cancel_target_id"`
+		ExecutionPrice    float64 `json:"execution_price"`
+		AggressorOrderID  string  `json:"aggressor_order_id"`
+		EndOfRun          bool    `json:"end_of_run"`
 	}
 
 	var decoded orderEventJSON
@@ -57,9 +87,15 @@ func (event *OrderEvent) UnmarshalJSON(data []byte) error {
 	if event.Volume == 0 {
 		event.Volume = decoded.Quantity
 	}
+	event.Ticker = decoded.Ticker
+	event.OrderType = decoded.OrderType
+	event.Seq = decoded.Seq
+	event.ContestantOrderID = decoded.ContestantOrderID
 	event.MatchedOrderID = decoded.MatchedOrderID
+	event.CancelTargetID = decoded.CancelTargetID
 	event.ExecutionPrice = decoded.ExecutionPrice
 	event.AggressorOrderID = decoded.AggressorOrderID
+	event.EndOfRun = decoded.EndOfRun
 
 	return nil
 }
@@ -105,11 +141,28 @@ func (batch *MetricsBatch) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// CorrectnessUpdate is emitted by the shadow engine whenever a submission's
-// validation state changes.
+// Verdict is the tri-state outcome of correctness validation.
+//
+// Unverified is the fail-safe default and the whole point of a third state: a
+// submission that was never conclusively checked — no end-of-run marker, a
+// truncated event stream, or a fill whose counterparty could not be mapped —
+// is neither correct nor incorrect. It must never silently read as correct
+// (that was the original fail-open bug) nor wrongly read as incorrect (that
+// would violate the paramount "never fail correct code" constraint). Only an
+// engine that fully replays to a clean agreement is Correct.
+type Verdict string
+
+const (
+	VerdictUnverified Verdict = "unverified"
+	VerdictCorrect    Verdict = "correct"
+	VerdictIncorrect  Verdict = "incorrect"
+)
+
+// CorrectnessUpdate is emitted by the replay engine when a submission's verdict
+// is finalized.
 type CorrectnessUpdate struct {
 	SubmissionID string
-	IsCorrect    bool
+	Verdict      Verdict
 	Reason       string
 }
 
@@ -122,7 +175,7 @@ type Score struct {
 	P90Ms        float64
 	P99Ms        float64
 	P99Bucket    int
-	Correct      bool
+	Verdict      Verdict
 }
 
 func normalizeEpochMicros(eventTimestamp, alternateTimestamp int64) int64 {

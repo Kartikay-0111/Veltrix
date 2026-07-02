@@ -89,8 +89,17 @@ func (p *Processor) Run(ctx context.Context, in <-chan models.OrderEvent, out ch
 }
 
 // Process pushes one event and emits every event now behind the watermark.
+//
+// The end-of-run marker is the last event a submission will ever produce, so no
+// later timestamp can arrive to advance the watermark past it. On that marker we
+// flush the whole heap in event-time order, guaranteeing the downstream engine
+// receives the complete stream (including the marker) promptly rather than only
+// at shutdown.
 func (p *Processor) Process(ctx context.Context, event models.OrderEvent, out chan<- models.OrderEvent) error {
 	p.Enqueue(event)
+	if event.EndOfRun {
+		return p.Flush(ctx, out)
+	}
 	return p.EmitReady(ctx, out)
 }
 

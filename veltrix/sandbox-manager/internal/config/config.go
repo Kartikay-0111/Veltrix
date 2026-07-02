@@ -39,6 +39,17 @@ type Config struct {
 	DefaultNumBots      int
 	DefaultDurationSecs int
 
+	// MaxConcurrentBenchmarks bounds how many submissions may drive the shared
+	// bot-fleet at once. The fleet pins one worker per CPU core, so overlapping
+	// runs contend for the same cores and pollute each other's latency numbers;
+	// the default of 1 serializes runs for fair, reproducible measurement.
+	MaxConcurrentBenchmarks int
+
+	// Correctness phase (serialized golden-model differential replay). Runs
+	// before the performance phase with a single writer and a fixed seed.
+	CorrectnessSeed         int
+	CorrectnessDurationSecs int
+
 	// Archive safety limits
 	MaxExtractSizeMB int
 	MaxFileSizeMB    int
@@ -60,26 +71,29 @@ func (c *Config) DSN() string {
 // Load reads all configuration from environment variables with defaults.
 func Load() *Config {
 	return &Config{
-		HealthPort:          envInt("HEALTH_PORT", 8081),
-		WorkerCount:         envInt("CONFIG_WORKER_COUNT", 10),
-		PostgresHost:        requireenv("POSTGRES_HOST"),
-		PostgresPort:        envInt("POSTGRES_PORT", 5432),
-		PostgresUser:        requireenv("POSTGRES_USER"),
-		PostgresPassword:    requireenv("POSTGRES_PASSWORD"),
-		PostgresDB:          requireenv("POSTGRES_DB"),
-		RedisHost:           getenv("REDIS_HOST", "redis"),
-		RedisPort:           envInt("REDIS_PORT", 6379),
-		MinIOEndpoint:       fmt.Sprintf("%s:%s", requireenv("MINIO_HOST"), getenv("MINIO_PORT", "9000")),
-		MinIOAccessKey:      requireenv("MINIO_ROOT_USER"),
-		MinIOSecretKey:      requireenv("MINIO_ROOT_PASSWORD"),
-		MinIOBucket:         getenv("MINIO_BUCKET", "submissions"),
-		SandboxNetwork:      getenv("SANDBOX_NETWORK", "sandbox-net"),
-		DefaultNumBots:      envInt("DEFAULT_NUM_BOTS", 100),
-		DefaultDurationSecs: envInt("DEFAULT_DURATION_SECS", 60),
-		MaxExtractSizeMB:    envInt("MAX_EXTRACT_SIZE_MB", 200),
-		MaxFileSizeMB:       envInt("MAX_FILE_SIZE_MB", 50),
-		MaxFileCount:        envInt("MAX_FILE_COUNT", 500),
-		StartupTimeoutSecs:  envInt("STARTUP_TIMEOUT_SECS", 15),
+		HealthPort:              envInt("HEALTH_PORT", 8081),
+		WorkerCount:             envInt("CONFIG_WORKER_COUNT", 10),
+		PostgresHost:            requireenv("POSTGRES_HOST"),
+		PostgresPort:            envInt("POSTGRES_PORT", 5432),
+		PostgresUser:            requireenv("POSTGRES_USER"),
+		PostgresPassword:        requireenv("POSTGRES_PASSWORD"),
+		PostgresDB:              requireenv("POSTGRES_DB"),
+		RedisHost:               getenv("REDIS_HOST", "redis"),
+		RedisPort:               envInt("REDIS_PORT", 6379),
+		MinIOEndpoint:           fmt.Sprintf("%s:%s", requireenv("MINIO_HOST"), getenv("MINIO_PORT", "9000")),
+		MinIOAccessKey:          requireenv("MINIO_ROOT_USER"),
+		MinIOSecretKey:          requireenv("MINIO_ROOT_PASSWORD"),
+		MinIOBucket:             getenv("MINIO_BUCKET", "submissions"),
+		SandboxNetwork:          getenv("SANDBOX_NETWORK", "sandbox-net"),
+		DefaultNumBots:          envInt("DEFAULT_NUM_BOTS", 100),
+		DefaultDurationSecs:     envInt("DEFAULT_DURATION_SECS", 60),
+		MaxConcurrentBenchmarks: envInt("MAX_CONCURRENT_BENCHMARKS", 1),
+		CorrectnessSeed:         envInt("CORRECTNESS_SEED", 42),
+		CorrectnessDurationSecs: envInt("CORRECTNESS_DURATION_SECS", 20),
+		MaxExtractSizeMB:        envInt("MAX_EXTRACT_SIZE_MB", 200),
+		MaxFileSizeMB:           envInt("MAX_FILE_SIZE_MB", 50),
+		MaxFileCount:            envInt("MAX_FILE_COUNT", 500),
+		StartupTimeoutSecs:      envInt("STARTUP_TIMEOUT_SECS", 15),
 	}
 }
 

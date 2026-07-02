@@ -38,6 +38,14 @@ struct BenchmarkConfig
     int duration_secs;
     std::string protocol; // "rest" | "websocket"
     int flush_interval_ms = 500;
+
+    // "correctness" → single serialized writer, full audit (orders+trades) with a
+    // monotonic seq and an end-of-run marker, for golden-model differential replay.
+    // "performance" → concurrent load, metrics only (no per-order audit).
+    std::string mode = "performance";
+    // Fixed RNG seed for the correctness run so every contestant faces the
+    // identical order sequence (0 = nondeterministic).
+    uint64_t seed = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +91,11 @@ private:
 
     TelemetryCounters counters_; // private, never shared
     AuditLog audit_log_;         // private correctness event buffer (shared-nothing)
+
+    // Monotonic sequence stamped on every audit event in correctness mode. Only
+    // the single correctness writer emits audit events, so a plain counter (no
+    // atomics) gives a total order over this submission's orders and trades.
+    uint64_t next_seq_ = 1;
 
     // gRPC stream handle — opened at benchmark start, closed at end
     std::unique_ptr<StreamHandle> grpc_stream_;

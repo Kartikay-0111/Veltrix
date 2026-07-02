@@ -12,8 +12,11 @@ static int64_t epoch_nanoseconds()
 
 RestBot::RestBot(const std::string &host,
                  const std::string &port,
-                 uint64_t bot_id)
-    : bot_id_(bot_id), current_order_type_(OrderType::LIMIT), rng_(std::random_device{}() ^ (bot_id * 2654435761ULL)) // unique seed per bot
+                 uint64_t bot_id,
+                 uint64_t seed)
+    : bot_id_(bot_id), current_order_type_(OrderType::LIMIT),
+      rng_(seed != 0 ? (seed ^ (bot_id * 2654435761ULL))                    // deterministic (correctness run)
+                     : (std::random_device{}() ^ (bot_id * 2654435761ULL))) // random (performance run)
       ,
       price_dist_(90, 110), qty_dist_(1, 100), ticker_dist_(0, static_cast<int>(TICKERS.size()) - 1), type_dist_(0, 5) // 0=LIMIT, 1=MARKET, 2=CANCEL, 3=FOK, 4=FAK, 5=GFD
 {

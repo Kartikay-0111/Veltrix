@@ -142,6 +142,15 @@ void ThreadWorker::start()
         // No threads are blocked waiting for sockets. Ever.
         ioc_.run();
 
+        // ── End-of-run marker: only the worker that actually ran the serialized
+        //    correctness writer emits it, so the checker finalizes the verdict
+        //    exactly once. Recorded here (after the event loop stops) so it can
+        //    never be lost to a suspended coroutine.
+        if (cfg_.mode == "correctness" && bots_this_thread_ > 0)
+        {
+            audit_log_.record_end_of_run(cfg_.submission_id, next_seq_++);
+        }
+
         // ── Final flush: send any remaining events before closing ─────────────
         if (grpc_stream_ && (!audit_log_.empty() || counters_.latency_samples > 0))
         {
@@ -219,25 +228,21 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
 {
     auto executor = co_await asio::this_coro::executor;
 
-    RestBot bot(cfg_.target_host, cfg_.target_port, bot_id);
+    const bool correctness = (cfg_.mode == "correctness");
+    RestBot bot(cfg_.target_host, cfg_.target_port, bot_id, cfg_.seed);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(cfg_.duration_secs);
 
     while (running_ && std::chrono::steady_clock::now() < deadline)
     {
         std::string request = bot.generate_request();
-
-        // ── INTENT: capture OrderSubmitted BEFORE sending ─────────────────────
         const auto &last = bot.last_order();
-        audit_log_.record_order(
-            cfg_.submission_id,
-            static_cast<int32_t>(bot_id),
-            last.order_id,
-            last.type,                       // action = LIMIT | MARKET | CANCEL | FOK | FAK | GFD
-            last.type == "CANCEL" ? "" : last.action,  // side = BUY | SELL (empty for CANCEL)
-            last.ticker,
-            last.price,
-            last.quantity,
-            /* cancel_target_id */ 0);
+
+        // Reserve this order's sequence number up front (correctness mode only),
+        // so the intent orders before its own fills even though the intent is
+        // recorded after the response (once its server id is known). Recording
+        // post-response also avoids the flush_loop clearing the audit buffer
+        // between the intent and its server-id attachment.
+        const uint64_t order_seq = correctness ? next_seq_++ : 0;
 
         // ── Record start time (nanosecond precision) ──────────────────────────
         auto t0 = std::chrono::steady_clock::now();
@@ -330,27 +335,56 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
                     catch (...) {}
                 }
 
-                // Unroll each individual trade from the trades[] array
-                auto trades = parse_trades_array(response_body);
-                for (const auto &trade : trades)
+                // Full audit only in correctness mode — the performance run emits
+                // metrics only, keeping the concurrent stream light.
+                if (correctness)
                 {
-                    // Determine which side is the "matched" resting order
-                    uint64_t matched_id = (trade.buy_order_id == contestant_order_id)
-                                              ? trade.sell_order_id
-                                              : trade.buy_order_id;
-
-                    audit_log_.record_trade(
+                    // Record the INTENT now that its server id is known, carrying the
+                    // reserved seq. For CANCEL the target is the server id the bot is
+                    // cancelling (its own order_id string is that id).
+                    uint64_t cancel_target_id = 0;
+                    if (last.type == "CANCEL")
+                    {
+                        try { cancel_target_id = std::stoull(last.order_id); }
+                        catch (...) {}
+                    }
+                    audit_log_.record_order(
                         cfg_.submission_id,
                         static_cast<int32_t>(bot_id),
+                        last.order_id,
+                        last.type,                                 // action = LIMIT | MARKET | CANCEL | FOK | FAK | GFD
+                        last.type == "CANCEL" ? "" : last.action,  // side = BUY | SELL (empty for CANCEL)
                         last.ticker,
-                        contestant_order_id,
-                        matched_id,
-                        trade.price,
-                        trade.qty,
-                        last.order_id); // join key: bot-generated aggressor order_id
+                        last.price,
+                        last.quantity,
+                        cancel_target_id,
+                        order_seq,
+                        contestant_order_id);
+
+                    // Unroll each individual trade from the trades[] array
+                    auto trades = parse_trades_array(response_body);
+                    for (const auto &trade : trades)
+                    {
+                        // Determine which side is the "matched" resting order
+                        uint64_t matched_id = (trade.buy_order_id == contestant_order_id)
+                                                  ? trade.sell_order_id
+                                                  : trade.buy_order_id;
+
+                        audit_log_.record_trade(
+                            cfg_.submission_id,
+                            static_cast<int32_t>(bot_id),
+                            last.ticker,
+                            contestant_order_id,
+                            matched_id,
+                            trade.price,
+                            trade.qty,
+                            last.order_id, // join key: bot-generated aggressor order_id
+                            next_seq_++);
+                    }
                 }
 
                 // Feed server-assigned order IDs back to the bot for cancel flow
+                // (needed in both modes so the bot can generate valid cancels).
                 if (bot.order_type() != OrderType::CANCEL && contestant_order_id > 0)
                 {
                     bot.record_accepted_order(contestant_order_id);

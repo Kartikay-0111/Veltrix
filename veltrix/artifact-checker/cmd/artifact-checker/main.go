@@ -19,7 +19,7 @@ import (
 	"veltrix/artifact-checker/internal/aggregator"
 	"veltrix/artifact-checker/internal/consumer"
 	"veltrix/artifact-checker/internal/models"
-	"veltrix/artifact-checker/internal/shadowengine"
+	"veltrix/artifact-checker/internal/replayengine"
 	"veltrix/artifact-checker/internal/storage"
 	"veltrix/artifact-checker/internal/watermark"
 )
@@ -85,7 +85,7 @@ func main() {
 	router := watermark.NewRouter(int64(config.allowedLateness / time.Microsecond))
 	router.Logger = logger
 
-	shadow := shadowengine.New(logger)
+	replay := replayengine.New(logger)
 	metricsAggregator := aggregator.New(10 * time.Second)
 	metricsAggregator.Logger = logger
 
@@ -108,8 +108,8 @@ func main() {
 	start("watermark-router", func(ctx context.Context) error {
 		return router.Run(ctx, consumerService.Events(), orderedEvents)
 	})
-	start("shadow-engine", func(ctx context.Context) error {
-		return shadow.Run(ctx, orderedEvents, correctnessUpdates)
+	start("replay-engine", func(ctx context.Context) error {
+		return replay.Run(ctx, orderedEvents, correctnessUpdates)
 	})
 	start("aggregator", func(ctx context.Context) error {
 		return metricsAggregator.Run(ctx, consumerService.Metrics(), correctnessUpdates, scores)
