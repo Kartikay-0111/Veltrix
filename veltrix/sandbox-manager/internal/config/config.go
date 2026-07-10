@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config holds all runtime configuration parsed from environment variables.
@@ -39,11 +40,12 @@ type Config struct {
 	DefaultNumBots      int
 	DefaultDurationSecs int
 
-	// MaxConcurrentBenchmarks bounds how many submissions may drive the shared
-	// bot-fleet at once. The fleet pins one worker per CPU core, so overlapping
-	// runs contend for the same cores and pollute each other's latency numbers;
-	// the default of 1 serializes runs for fair, reproducible measurement.
-	MaxConcurrentBenchmarks int
+	// FleetPoolURLs is a list of bot-fleet base URLs (e.g. ["http://bot-fleet-1:7070"]).
+	// Each URL is a separate bot-fleet instance on its own machine with exclusive
+	// CPU cores. The fleet pool dispatches each benchmark to the least-loaded
+	// instance, enabling true parallel benchmarking without core contention.
+	// Populated from FLEET_POOL_URLS (comma-separated).
+	FleetPoolURLs []string
 
 	// Correctness phase (serialized golden-model differential replay). Runs
 	// before the performance phase with a single writer and a fixed seed.
@@ -72,7 +74,7 @@ func (c *Config) DSN() string {
 func Load() *Config {
 	return &Config{
 		HealthPort:              envInt("HEALTH_PORT", 8081),
-		WorkerCount:             envInt("CONFIG_WORKER_COUNT", 10),
+		WorkerCount:             envInt("CONFIG_WORKER_COUNT", 8),
 		PostgresHost:            requireenv("POSTGRES_HOST"),
 		PostgresPort:            envInt("POSTGRES_PORT", 5432),
 		PostgresUser:            requireenv("POSTGRES_USER"),
@@ -87,7 +89,7 @@ func Load() *Config {
 		SandboxNetwork:          getenv("SANDBOX_NETWORK", "sandbox-net"),
 		DefaultNumBots:          envInt("DEFAULT_NUM_BOTS", 100),
 		DefaultDurationSecs:     envInt("DEFAULT_DURATION_SECS", 60),
-		MaxConcurrentBenchmarks: envInt("MAX_CONCURRENT_BENCHMARKS", 1),
+		FleetPoolURLs:           envStringSlice("FLEET_POOL_URLS", []string{"http://bot-fleet:7070"}),
 		CorrectnessSeed:         envInt("CORRECTNESS_SEED", 42),
 		CorrectnessDurationSecs: envInt("CORRECTNESS_DURATION_SECS", 20),
 		MaxExtractSizeMB:        envInt("MAX_EXTRACT_SIZE_MB", 200),
@@ -102,6 +104,25 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envStringSlice(key string, fallback []string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	parts := strings.Split(v, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	if len(result) == 0 {
+		return fallback
+	}
+	return result
 }
 
 func requireenv(key string) string {

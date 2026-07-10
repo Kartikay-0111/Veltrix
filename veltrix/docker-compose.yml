@@ -128,6 +128,10 @@ services:
       DEFAULT_NUM_BOTS: 100
       DEFAULT_DURATION_SECS: 60
       SANDBOX_NETWORK: sandbox-net
+      # Comma-separated list of bot-fleet instances.
+      # Add more URLs here (on separate machines) to scale horizontally.
+      # Each instance owns its CPU cores exclusively — no core contention.
+      FLEET_POOL_URLS: "http://bot-fleet:7070"
     ports:
       - "8081:8081"
     volumes:
