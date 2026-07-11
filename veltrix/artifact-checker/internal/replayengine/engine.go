@@ -32,8 +32,10 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"veltrix/artifact-checker/internal/models"
 )
@@ -42,23 +44,44 @@ import (
 // the submission through the golden model and emits a single final verdict.
 //
 // The engine buffers a submission's events and replays them in `seq` order; the
-// serialized correctness run keeps this buffer tiny (one writer). State is keyed
-// by SubmissionID and mutated from a single goroutine (Run), so no locks.
+// serialized correctness run keeps this buffer tiny (one writer). The bookkeeping
+// maps (buffers, finalized) are keyed by SubmissionID and mutated only from the
+// Run goroutine, so they need no locks. The CPU-heavy golden-model replay itself
+// is offloaded onto worker goroutines: each submission's events are lifted off
+// the buffer map before hand-off and replay is self-contained per submission, so
+// concurrent replays share no state and cannot change any verdict — only the
+// order verdicts land on the updates channel, which the aggregator keys by
+// SubmissionID and does not depend on. Offloading keeps the Run loop draining its
+// input at all times, so a burst of end-of-run markers can never stall the
+// upstream watermark router or the Kafka consumer.
 type Engine struct {
 	buffers   map[string][]models.OrderEvent
 	finalized map[string]struct{}
 	logger    *log.Logger
+
+	// sem bounds the number of concurrent replays; wg tracks in-flight workers so
+	// the updates channel is not closed until every worker has sent its verdict.
+	sem chan struct{}
+	wg  sync.WaitGroup
 }
 
 func New(logger *log.Logger) *Engine {
 	if logger == nil {
 		logger = log.Default()
 	}
-	logger.Printf("[replayengine] ready (golden-model differential replay, standard price-time spec)")
+	// Bound concurrency to the process's scheduling width (GOMAXPROCS, already set
+	// by the time the engine is constructed). More workers than that only adds
+	// scheduling overhead, since each replay is CPU-bound.
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	logger.Printf("[replayengine] ready (golden-model differential replay, standard price-time spec, replay workers=%d)", workers)
 	return &Engine{
 		buffers:   make(map[string][]models.OrderEvent),
 		finalized: make(map[string]struct{}),
 		logger:    logger,
+		sem:       make(chan struct{}, workers),
 	}
 }
 
@@ -69,7 +92,11 @@ func (e *Engine) Run(
 	in <-chan models.OrderEvent,
 	updates chan<- models.CorrectnessUpdate,
 ) error {
+	// Registered first so it runs LAST: the channel is closed only after every
+	// in-flight replay worker (waited on just below) has finished sending, which
+	// avoids a send-on-closed-channel panic.
 	defer close(updates)
+	defer e.wg.Wait()
 
 	for {
 		select {
@@ -89,13 +116,40 @@ func (e *Engine) Run(
 			e.buffers[event.SubmissionID] = append(e.buffers[event.SubmissionID], event)
 
 			if event.EndOfRun {
-				update := e.finalize(event.SubmissionID)
-				if err := send(ctx, updates, update); err != nil {
-					return err
-				}
+				// Lift this submission's events off the buffer map on the Run
+				// goroutine (preserving the single-owner invariant) and replay them
+				// on a worker so the loop keeps draining `in`.
+				e.dispatch(ctx, event.SubmissionID, e.takeEvents(event.SubmissionID), updates)
 			}
 		}
 	}
+}
+
+// dispatch replays a finalized submission on a worker goroutine and sends its
+// verdict. The concurrency semaphore is acquired inside the worker, never on the
+// Run goroutine — acquiring it before spawning would let a burst of finalizations
+// block the drain loop and reintroduce the very back-pressure this offloading
+// removes. The lifted event slice is tiny (serialized one-writer run), so
+// in-flight memory stays bounded by (pending replays × small slice).
+func (e *Engine) dispatch(
+	ctx context.Context,
+	submissionID string,
+	events []models.OrderEvent,
+	updates chan<- models.CorrectnessUpdate,
+) {
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+
+		select {
+		case e.sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		defer func() { <-e.sem }()
+
+		_ = send(ctx, updates, e.finalize(submissionID, events))
+	}()
 }
 
 func (e *Engine) flushAll(ctx context.Context, updates chan<- models.CorrectnessUpdate) error {
@@ -106,18 +160,32 @@ func (e *Engine) flushAll(ctx context.Context, updates chan<- models.Correctness
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		if err := send(ctx, updates, e.finalize(id)); err != nil {
+		// Nothing left in `buffers` ever received an end-of-run marker (that path
+		// deletes on dispatch), so every submission here hits the Unverified branch
+		// below without running the golden model — cheap enough to do inline.
+		if err := send(ctx, updates, e.finalize(id, e.takeEvents(id))); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (e *Engine) finalize(submissionID string) models.CorrectnessUpdate {
+// takeEvents lifts a submission's buffered events off the bookkeeping maps and
+// marks it finalized. It must run on the Run goroutine only: this is where the
+// no-lock, single-owner invariant on buffers/finalized lives. The returned slice
+// is owned exclusively by the caller (a worker), so replay touches no shared state.
+func (e *Engine) takeEvents(submissionID string) []models.OrderEvent {
 	events := e.buffers[submissionID]
 	delete(e.buffers, submissionID)
 	e.finalized[submissionID] = struct{}{}
+	return events
+}
 
+// finalize replays a submission's events through the golden model and builds its
+// verdict. It is pure over its arguments (reading only the shared logger, which is
+// safe for concurrent use), so it runs on worker goroutines concurrently across
+// submissions.
+func (e *Engine) finalize(submissionID string, events []models.OrderEvent) models.CorrectnessUpdate {
 	// A verdict is only trustworthy if the whole serialized stream arrived. The
 	// end-of-run sentinel is that proof; without it the stream may be truncated
 	// (a consumer-group rebalance resuming AtEnd, or a lost final batch), so

@@ -31,6 +31,12 @@ type Processor struct {
 	// MaxSeenTimestamp to derive the current watermark.
 	AllowedLateness int64
 
+	// IdleFlushTimeout is how long Run() waits with no incoming events before
+	// force-flushing the heap. Handles the case where the EndOfRun marker is
+	// lost (bot-fleet crash / gRPC failure) — without this the heap never drains
+	// and the correctness verdict stays UNVERIFIED indefinitely.
+	IdleFlushTimeout time.Duration
+
 	events       EventHeap
 	nextSequence uint64
 }
@@ -49,8 +55,9 @@ func NewProcessor(allowedLatenessMicros int64) *Processor {
 	}
 
 	processor := &Processor{
-		AllowedLateness: allowedLatenessMicros,
-		events:          EventHeap{},
+		AllowedLateness:  allowedLatenessMicros,
+		IdleFlushTimeout: 30 * time.Second,
+		events:           EventHeap{},
 	}
 
 	heap.Init(&processor.events)
@@ -71,7 +78,15 @@ func NewProcessor(allowedLatenessMicros int64) *Processor {
 //
 // When in is closed, Run drains all remaining events in strict heap order because
 // no later input can arrive to move the watermark forward.
+//
+// If no event arrives within IdleFlushTimeout, Run force-flushes the heap. This
+// handles the case where the EndOfRun marker was lost (bot-fleet crash / gRPC
+// stream failure): without the force-flush the heap would never drain and the
+// correctness verdict would remain UNVERIFIED indefinitely.
 func (p *Processor) Run(ctx context.Context, in <-chan models.OrderEvent, out chan<- models.OrderEvent) error {
+	idleTimer := time.NewTimer(p.IdleFlushTimeout)
+	defer idleTimer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -81,9 +96,27 @@ func (p *Processor) Run(ctx context.Context, in <-chan models.OrderEvent, out ch
 				return p.Flush(ctx, out)
 			}
 
+			// Reset idle timer — only fires after a genuine gap with no activity.
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(p.IdleFlushTimeout)
+
 			if err := p.Process(ctx, event, out); err != nil {
 				return err
 			}
+
+		case <-idleTimer.C:
+			// No events for IdleFlushTimeout — EndOfRun was likely lost.
+			// Flush buffered events so the shadow engine can finalize verdict.
+			if err := p.Flush(ctx, out); err != nil {
+				return err
+			}
+			// Re-arm for any late-arriving trickle of events.
+			idleTimer.Reset(p.IdleFlushTimeout)
 		}
 	}
 }

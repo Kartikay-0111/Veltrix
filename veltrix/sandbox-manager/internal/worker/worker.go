@@ -198,19 +198,38 @@ func (p *Pool) process(ctx context.Context, submissionID string) {
 	})
 	p.logger.Printf("[process:%s] sandbox READY → %s", submissionID, result.EndpointURL)
 
-	if err := p.triggerBotFleet(ctx, submissionID, result.TargetHost); err != nil {
+	// perfStarted is closed by triggerBotFleet's performance goroutine exactly
+	// when the performance dispatch is confirmed (202 received). The cleanup
+	// goroutine waits on this so the container lifetime is anchored to when the
+	// performance benchmark actually starts, not to when this function runs.
+	perfStarted := make(chan struct{})
+
+	if err := p.triggerBotFleet(ctx, submissionID, result.TargetHost, perfStarted); err != nil {
 		p.logger.Printf("[process:%s] bot fleet trigger failed: %v", submissionID, err)
+		close(perfStarted) // unblock cleanup goroutine on trigger failure
 	}
 
 	_ = p.db.UpdateStatus(ctx, submissionID, "RUNNING", nil)
 
 	// ── 5. Schedule cleanup after the benchmark window ────────────────────────
-	// Cover both phases: correctness + gap + performance, then a grace window.
-	cleanupDelay := time.Duration(
-		p.cfg.CorrectnessDurationSecs+benchmarkPhaseGapSecs+p.cfg.DefaultDurationSecs+300) * time.Second
+	// Wait for the performance phase to actually start before counting down.
+	// This prevents premature container removal when fleet dispatch was delayed.
 	go func() {
-		p.logger.Printf("[process:%s] cleanup scheduled in %s", submissionID, cleanupDelay)
-		time.Sleep(cleanupDelay)
+		// Absolute safety net: if perfStarted is never closed, clean up after
+		// the maximum possible window (correctness + gap + perf + 10min buffer).
+		maxWait := time.Duration(
+			p.cfg.CorrectnessDurationSecs+benchmarkPhaseGapSecs+p.cfg.DefaultDurationSecs+600) * time.Second
+
+		select {
+		case <-perfStarted:
+			// Performance confirmed — wait for it to complete + 5 min grace.
+			p.logger.Printf("[process:%s] perf started, cleanup in %ds",
+				submissionID, p.cfg.DefaultDurationSecs+300)
+			time.Sleep(time.Duration(p.cfg.DefaultDurationSecs+300) * time.Second)
+		case <-time.After(maxWait):
+			p.logger.Printf("[process:%s] cleanup safety net fired", submissionID)
+		}
+
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
@@ -283,7 +302,11 @@ func (p *Pool) buildImage(ctx context.Context, sub *db.Submission, imageTag stri
 // complete before performance so the checker finalises the verdict first).
 // Different submissions are dispatched to different fleet instances in parallel
 // — no serialisation between submissions.
-func (p *Pool) triggerBotFleet(ctx context.Context, submissionID, targetHost string) error {
+//
+// perfStarted is closed exactly when the performance dispatch is confirmed
+// (202 received from the fleet). The caller uses this signal to anchor the
+// container cleanup timer to the actual start of the performance benchmark.
+func (p *Pool) triggerBotFleet(ctx context.Context, submissionID, targetHost string, perfStarted chan<- struct{}) error {
 	targetPort := fmt.Sprintf("%d", dockerpkg.SandboxPort)
 
 	// ── Phase 1: correctness (serialized golden-model differential replay) ────
@@ -306,6 +329,7 @@ func (p *Pool) triggerBotFleet(ctx context.Context, submissionID, targetHost str
 	// ── Phase 2: performance — wait for correctness to finish, then dispatch ──
 	go func() {
 		time.Sleep(time.Duration(p.cfg.CorrectnessDurationSecs+benchmarkPhaseGapSecs) * time.Second)
+
 		perf := map[string]any{
 			"submission_id": submissionID,
 			"target_host":   targetHost,
@@ -315,13 +339,25 @@ func (p *Pool) triggerBotFleet(ctx context.Context, submissionID, targetHost str
 			"num_bots":      p.cfg.DefaultNumBots,
 			"duration_secs": p.cfg.DefaultDurationSecs,
 		}
-		if err := p.fleetPool.Dispatch(context.Background(), submissionID, perf); err != nil {
+
+		// Hard deadline: if the fleet is still full after this window, abort.
+		// Prevents an orphaned goroutine spinning forever on context.Background().
+		// The deadline is generous: 10 minutes of retry time on top of the sleep above.
+		dispatchCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		if err := p.fleetPool.Dispatch(dispatchCtx, submissionID, perf); err != nil {
 			p.logger.Printf("[trigger:%s] performance phase dispatch failed: %v",
 				submissionID, err)
+			close(perfStarted) // unblock cleanup goroutine on failure path
 			return
 		}
+
 		p.logger.Printf("[trigger:%s] performance phase dispatched (%d bots, %ds)",
 			submissionID, p.cfg.DefaultNumBots, p.cfg.DefaultDurationSecs)
+
+		// Signal that performance has started — cleanup timer starts from here.
+		close(perfStarted)
 	}()
 
 	return nil

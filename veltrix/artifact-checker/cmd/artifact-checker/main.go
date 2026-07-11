@@ -162,7 +162,12 @@ func loadConfig() (appConfig, error) {
 	if err != nil {
 		return appConfig{}, err
 	}
-	maxProcs, err := parsePositiveInt("ARTIFACT_CHECKER_GOMAXPROCS", 1)
+	// Default to all cores so the replay workers, watermark router, consumer, and
+	// publisher can run in parallel. Pinning this to 1 serializes the whole
+	// pipeline onto one OS thread, making a CPU-heavy replay stall every other
+	// stage (and, via back-pressure, the Kafka consumer). Override explicitly if a
+	// deployment needs to cap CPU.
+	maxProcs, err := parsePositiveInt("ARTIFACT_CHECKER_GOMAXPROCS", runtime.NumCPU())
 	if err != nil {
 		return appConfig{}, err
 	}

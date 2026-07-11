@@ -253,8 +253,17 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
             co_await asio::async_write(socket,
                                        asio::buffer(request), asio::use_awaitable);
 
-            // ── Read response headers with a 1s timeout ──────────────────────
-            asio::steady_timer timeout_timer(executor, 1s);
+            // ── Read response headers ─────────────────────────────────────────
+            // Correctness mode: 5s timeout — 1 bot with minimal load, so a
+            // slow response is likely a transient network hiccup rather than a
+            // hung server. A 1s timeout risks a ghost order: the server processes
+            // the request but the bot times out, moves to the next order, and the
+            // shadow engine diverges from the real order book → wrong INCORRECT
+            // verdict on a correct submission.
+            // Performance mode: 1s timeout — we want to detect slow servers fast
+            // so bots can keep saturating throughput measurements.
+            const auto request_timeout = (cfg_.mode == "correctness") ? 5s : 1s;
+            asio::steady_timer timeout_timer(executor, request_timeout);
             asio::streambuf response_buf;
 
             bool timed_out = false;

@@ -421,3 +421,67 @@ func TestReplayDedupesRedeliveredFill(t *testing.T) {
 		t.Fatalf("duplicate fill must be deduped and stay correct, got %s: %s", v, reason)
 	}
 }
+
+// withSub restamps an event onto a different submission so we can drive many
+// independent streams through one engine.
+func withSub(id string, ev models.OrderEvent) models.OrderEvent {
+	ev.SubmissionID = id
+	return ev
+}
+
+// TestEngineRunConcurrentSubmissions drives many submissions' end-of-run markers
+// through Run in one burst and checks every verdict arrives correctly. It exists
+// to exercise the offloaded-replay path: replays run on worker goroutines while
+// the loop keeps draining, verdicts may land out of order, and the updates
+// channel must not close until every worker has sent (run with -race). One
+// submission is deliberately incorrect (an over-fill) to prove parallelism does
+// not blur verdicts across streams.
+func TestEngineRunConcurrentSubmissions(t *testing.T) {
+	const n = 64
+	e := New(log.New(io.Discard, "", 0))
+	in := make(chan models.OrderEvent, 8)
+	updates := make(chan models.CorrectnessUpdate, n)
+
+	ctx, canc := context.WithCancel(context.Background())
+	defer canc()
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx, in, updates) }()
+
+	want := make(map[string]models.Verdict, n)
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("sub-%d", i)
+		fillQty := 10
+		if i%7 == 0 {
+			fillQty = 20 // over-fill: the golden model only matches 10 → Incorrect
+			want[id] = models.VerdictIncorrect
+		} else {
+			want[id] = models.VerdictCorrect
+		}
+		for _, ev := range []models.OrderEvent{
+			withSub(id, intent(1, "S1", "SELL", "LIMIT", "AAA", 100, 10, 1)),
+			withSub(id, intent(2, "B1", "BUY", "LIMIT", "AAA", 100, 10, 2)),
+			withSub(id, fill(3, "B1", 1, 100, fillQty)),
+			{SubmissionID: id, Seq: 4, EndOfRun: true},
+		} {
+			in <- ev
+		}
+	}
+	close(in)
+
+	got := make(map[string]models.Verdict, n)
+	for u := range updates { // ranges until Run closes updates after all workers finish
+		got[u.SubmissionID] = u.Verdict
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("got %d verdicts, want %d", len(got), len(want))
+	}
+	for id, w := range want {
+		if got[id] != w {
+			t.Errorf("submission %s: got verdict=%s, want %s", id, got[id], w)
+		}
+	}
+}
