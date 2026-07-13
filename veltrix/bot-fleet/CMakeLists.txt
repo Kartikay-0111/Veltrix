@@ -14,7 +14,7 @@ add_compile_options(
 )
 
 # ── Find dependencies ─────────────────────────────────────────────────────────
-find_package(Boost 1.78 REQUIRED COMPONENTS system)
+find_package(Boost 1.78 REQUIRED COMPONENTS system json)
 find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
 
@@ -82,6 +82,7 @@ target_include_directories(bot_fleet PRIVATE
 target_link_libraries(bot_fleet
     PRIVATE
     Boost::system
+    Boost::json
     Threads::Threads
     ${URING_LIB}             # -luring
     ${GRPC_LIBRARIES}        # gRPC++

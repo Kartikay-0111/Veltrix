@@ -60,6 +60,7 @@ bool GrpcTelemetryClient::send_batch(
         pb_order->set_seq(order.seq);
         pb_order->set_contestant_order_id(order.contestant_order_id);
         pb_order->set_end_of_run(order.end_of_run);
+        pb_order->set_outcome(static_cast<int32_t>(order.outcome));
     }
 
     // ── Pack TradeExecuted events ────────────────────────────────────────────

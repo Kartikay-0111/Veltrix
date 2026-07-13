@@ -34,6 +34,7 @@ FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-system1.83.0 \
+    libboost-json1.83.0 \
     liburing2 \
     libgrpc++1.51t64 \
     libprotobuf32 \

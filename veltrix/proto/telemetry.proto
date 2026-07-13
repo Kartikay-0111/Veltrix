@@ -27,6 +27,15 @@ message OrderSubmitted {
                                    // (for cancel replay and counterparty checks).
   bool   end_of_run       = 13; // Sentinel: the serialized correctness run is complete;
                                 // the checker finalizes the verdict on this marker.
+  int32  outcome          = 14; // Attempt outcome, so a lost/rejected response is not
+                                // a silent hole in the seq stream:
+                                //   0 = OK       — clean 200, order applied by the server.
+                                //   1 = REJECTED — clean 4xx, server rejected it; the book
+                                //                  is unchanged, so replay treats it as a
+                                //                  no-op while keeping seq contiguous.
+                                //   2 = UNKNOWN  — timeout / 5xx / connection or parse error;
+                                //                  the server MAY have applied it, so the
+                                //                  checker cannot trust the book → Unverified.
 }
 
 // ─── Event Type 2: Observation ───────────────────────────────────────────────

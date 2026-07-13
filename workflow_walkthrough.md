@@ -1,487 +1,383 @@
-# Veltrix — End-to-End Workflow: Submission → Leaderboard
+# Veltrix — Project Walkthrough
 
 ---
 
-## Architecture at a Glance
+## What is Veltrix?
+
+Veltrix is a **platform that automatically tests and ranks exchange servers** built by contestants in a competitive programming contest.
+
+Contestants write a server that acts as a stock exchange — it accepts BUY/SELL/CANCEL orders and matches them. Veltrix deploys each server, throws realistic trading traffic at it, checks if the matching logic is correct, measures how fast it responds, and shows results on a live leaderboard.
+
+### The Problem it Solves
+
+Normal competitive programming judges compare your program's output to expected output. That doesn't work here because:
+
+- The server runs continuously (it's not a one-shot program)
+- Output depends on timing and order of requests (not deterministic by nature)
+- We care about **speed** (throughput, latency), not just correctness
+- We need to test under real concurrent load, not just single test cases
+
+### How it Works (Short Version)
+
+```
+Contestant uploads code (.tar.gz)
+    → Platform builds it in Docker
+    → Runs it in a locked-down container (limited CPU, RAM, no internet)
+    → Sends thousands of trading orders to it (correctness check + load test)
+    → Records every request and response
+    → Replays them through a trusted reference engine to verify correctness
+    → Measures throughput (requests/sec) and latency (P99)
+    → Updates a live leaderboard in the browser
+```
+
+### Full Flow Diagram
 
 ```mermaid
 flowchart TD
-    A["👤 Contestant\nPOST /submit\n(X-API-Key + .tar.gz)"] --> B
+    A["👤 Contestant uploads .tar.gz"] -->|"POST /submit"| B["submission-service"]
 
-    subgraph submission-service ["submission-service :8080"]
-        B["1. Auth → verify API key\n(Postgres teams table)"]
-        B --> C["2. Upload archive → MinIO\n(streaming, no temp disk)"]
-        C --> D["3. INSERT PENDING row\n(Postgres submissions)"]
-        D --> E["4. RPUSH submission_queue\n(Redis)"]
-    end
+    B -->|"1. Verify API key"| B1["Postgres: teams table"]
+    B -->|"2. Store archive"| B2["MinIO: file storage"]
+    B -->|"3. Save submission"| B3["Postgres: status = PENDING"]
+    B -->|"4. Queue job"| B4["Redis: RPUSH submission_queue"]
 
-    E --> F
+    B4 -->|"BLPOP"| C["sandbox-manager"]
 
-    subgraph sandbox-manager ["sandbox-manager"]
-        F["Dispatcher\nBLPOP submission_queue"]
-        F --> G["Worker N\n(bounded pool)"]
-        G --> G1["→ status: BUILDING\nDownload archive from MinIO"]
-        G1 --> G2["Extract archive safely\n(size/count limits)"]
-        G2 --> G3["Render Dockerfile\n(cpp/rust/go)"]
-        G3 --> G4["docker build\n(10min timeout)"]
-        G4 --> G5["docker run\n(512MB RAM, 1 CPU, 1000 PIDs\nno-new-privileges, all caps dropped)"]
-        G5 --> G6["Poll port 9999\n(15s timeout)"]
-        G6 --> G7["→ status: READY\nendpoint_url saved to DB"]
-        G7 --> H["HTTP POST bot-fleet:7070/benchmark\n+ PUBLISH bot_fleet_triggers (Redis)"]
-        G7 --> G8["→ status: RUNNING"]
-    end
+    C -->|"5. Download archive"| C1["Build Docker image\n(10 min timeout)"]
+    C1 -->|"6. Start container"| C2["Run server in sandbox\n(512MB RAM, 1 CPU, no internet)"]
+    C2 -->|"7. Wait for port 9999"| C3["Server is READY"]
 
-    H --> I
+    C3 -->|"8. Pick least-loaded machine"| D["bot-fleet (C++)"]
 
-    subgraph bot-fleet ["bot-fleet (C++)"]
-        I["FleetCommander\nspawns N ThreadWorkers"]
-        I --> J["Each thread:\nSend HTTP order to sandbox :9999\n(BUY/SELL/CANCEL)"]
-        J --> K["Record intent in AuditLog\n(bot order_id, side, price, qty)"]
-        K --> L["Parse response fills\nlog_trade(..., aggressor_order_id=last.order_id)"]
-        L --> M["record() counters\n→ HDR histogram (18 buckets)\nTimeouts: counter only, no histogram"]
-        M --> N["Every 500ms:\ngRPC AuditBatch → telemetry-ingester\n(gzip-compressed protobuf stream)"]
-    end
+    D -->|"Phase 1: Correctness\n(1 bot, fixed seed)"| D1["Send orders → Record responses"]
+    D -->|"Phase 2: Performance\n(100+ bots)"| D2["Send orders → Measure latency"]
 
-    N --> O
+    D1 -->|"gRPC every 500ms"| E["telemetry-ingester"]
+    D2 -->|"gRPC every 500ms"| E
 
-    subgraph telemetry-ingester ["telemetry-ingester :8091"]
-        O["StreamTelemetry gRPC handler\nReceives AuditBatch"]
-        O --> P1["PublishOrderEvents\nOrderSubmitted → JSON → order_events topic\n(Kafka/Redpanda)"]
-        O --> P2["PublishTradeEvents\nTradeExecuted + aggressor_order_id → JSON\n→ order_events topic"]
-        O --> P3["PublishMetrics\nMetricsBatch → JSON → order_metrics topic"]
-    end
+    E -->|"9. Convert to JSON"| F["Redpanda (Kafka)\norder_events + order_metrics topics"]
 
-    P1 --> Q
-    P2 --> Q
-    P3 --> R
+    F -->|"10. Consume events"| G["artifact-checker"]
 
-    subgraph artifact-checker ["artifact-checker"]
-        Q["Consumer\nPolls order_events from Redpanda\ndecodes → OrderEvent channel"]
-        R["Consumer\nPolls order_metrics\ndecodes → MetricsBatch channel"]
+    G --> G1["Reorder events by timestamp\n(watermark processor)"]
+    G1 --> G2["Replay through golden model\n→ CORRECT / INCORRECT"]
+    G --> G3["Compute TPS and P99\nfrom latency histogram"]
+    G2 --> G4["Combine verdict + performance\n→ Final Score"]
+    G3 --> G4
 
-        Q --> S["Router\nDemux by submission_id\n→ per-submission channel"]
-        S --> T["Watermark Processor\n(per submission)\nMin-heap, 2s lateness window\nEmits events in event-time order"]
+    G4 -->|"11. Save score"| H1["Postgres: leaderboard_metrics"]
+    G4 -->|"12. Publish update"| H2["Redis: PUBLISH leaderboard_updates"]
 
-        T --> U["Shadow Engine\n(per submission)"]
-        U --> U1["BUY/SELL → recordIntent()\nsave intent + snap bestOpposing"]
-        U --> U2["FILL → validateFill()\njoin via AggressorOrderID\n✓ Volume conservation\n✓ Limit-price bound\n✓ (optional) Price-time priority"]
-        U --> U3["CANCEL → tolerated\n(server IDs ≠ bot IDs)"]
-        U2 --> V["CorrectnessUpdate\n{submission_id, is_correct}"]
+    H2 -->|"13. Receive update"| I["leaderboard-service"]
+    I --> I1["Render HTML row"]
+    I1 -->|"WebSocket"| I2["🖥️ Browser updates\nleaderboard in real-time"]
 
-        R --> W["Aggregator\nmerge per-thread MetricsBatches\nevery flush interval:\nTPS = http200Delta / elapsed_secs\nP50/P90/P99 from 18-bucket HDR histogram"]
-        V --> W
-
-        W --> X["Score emitted\n{submission_id, TPS, P50, P90, P99, correct}"]
-    end
-
-    X --> Y
-
-    subgraph publisher ["artifact-checker → Publisher"]
-        Y["Async INSERT → Postgres\nleaderboard_metrics\n(team_id, tps, p50, p90, p99, is_correct)"]
-        Y --> Z["Redis pipeline:\nHSET leaderboard_state submission_id payload\nPUBLISH leaderboard_updates payload"]
-    end
-
-    Z --> AA
-
-    subgraph leaderboard-service ["leaderboard-service :8085"]
-        AA["RedisSubscriber\nSUBSCRIBE leaderboard_updates"]
-        AA --> AB["Render row.html template\n(HTMX OOB swap fragment)"]
-        AB --> AC["WebSocket Hub\nbroadcast to all connected browsers"]
-        AC --> AD["Browser\nHTMX OOB swap → updates table row"]
-    end
-
-    style submission-service fill:#1a1a2e,color:#e2e8f0
-    style sandbox-manager fill:#16213e,color:#e2e8f0
-    style bot-fleet fill:#0f3460,color:#e2e8f0
-    style telemetry-ingester fill:#533483,color:#e2e8f0
-    style artifact-checker fill:#1b4332,color:#e2e8f0
-    style publisher fill:#1b4332,color:#e2e8f0
-    style leaderboard-service fill:#7b2d00,color:#e2e8f0
+    style B fill:#1a1a2e,color:#e2e8f0
+    style C fill:#16213e,color:#e2e8f0
+    style D fill:#0f3460,color:#e2e8f0
+    style E fill:#533483,color:#e2e8f0
+    style G fill:#1b4332,color:#e2e8f0
+    style I fill:#7b2d00,color:#e2e8f0
 ```
 
 ---
 
-## Phase 1 — Submission Intake (`submission-service`)
+## Tech Stack (and Why)
 
-**Trigger:** Contestant runs:
+| Component | Tech | Why this choice |
+|---|---|---|
+| Bot-fleet (sends orders) | C++ | Need precise latency measurement. Go/Java garbage collector pauses would add fake latency to measurements. |
+| Sandbox manager | Go | Great for managing many tasks at once (goroutines). Easy Docker and Redis integration. |
+| Message queue | Redpanda (Kafka-compatible) | Handles high-throughput event streaming. Groups events by submission so they stay in order. |
+| Correctness checker | Go | Runs the golden-model matching engine and compares results. |
+| Leaderboard | Go + HTMX + WebSocket | Live table updates without any frontend framework. Server sends HTML fragments, browser swaps them in. |
+| Storage | Postgres, Redis, MinIO | Postgres for scores and status. Redis for job queue and live updates. MinIO for file storage. |
+
+---
+
+## The 7 Services
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌──────────────┐
+│ submission-      │     │ sandbox-          │     │ bot-fleet    │
+│ service          │────▶│ manager           │────▶│ (C++)        │
+│ (receives code)  │     │ (builds & runs)   │     │ (sends load) │
+└─────────────────┘     └──────────────────┘     └──────┬───────┘
+                                                        │ gRPC
+                                                        ▼
+┌─────────────────┐     ┌──────────────────┐     ┌──────────────┐
+│ leaderboard-     │◀────│ artifact-         │◀────│ telemetry-   │
+│ service          │     │ checker           │     │ ingester     │
+│ (live UI)        │     │ (checks results)  │     │ (gRPC→Kafka) │
+└─────────────────┘     └──────────────────┘     └──────────────┘
+                              ▲
+                              │
+                         ┌────┴─────┐
+                         │ Redpanda │
+                         │ (Kafka)  │
+                         └──────────┘
+```
+
+---
+
+## Step-by-Step Flow
+
+### Step 1 — Contestant Submits Code (`submission-service`)
+
 ```bash
 curl -X POST http://localhost:8080/submit \
-  -H "X-API-Key: test-api-key-1234" \
+  -H "X-API-Key: my-team-key" \
   -F "language=cpp" \
   -F "file=@submission.tar.gz"
 ```
 
-**What happens, step by step:**
+What happens:
+1. Verify the API key (check team exists in Postgres)
+2. Upload the archive to MinIO (file storage)
+3. Save a `PENDING` row in Postgres
+4. Push the submission ID into a Redis queue
+5. Return `202 Accepted` immediately — all heavy work happens in the background
 
-| Step | Code | Action |
+### Step 2 — Build and Run the Server (`sandbox-manager`)
+
+A pool of worker goroutines picks up jobs from the Redis queue. Each worker:
+
+1. Downloads the archive from MinIO
+2. Extracts it safely (with size limits to prevent zip bombs)
+3. Generates a Dockerfile based on language (C++, Rust, or Go)
+4. Runs `docker build` (10-minute timeout)
+5. Starts the container with strict limits:
+   - 512 MB RAM
+   - 1 CPU core
+   - No internet access
+   - All Linux capabilities dropped
+6. Waits for the server to start listening on port 9999 (15-second timeout)
+7. If it starts → status becomes `READY`
+8. If it crashes or times out → status becomes `FAILED_STARTUP` / `FAILED_RESOURCE` / etc.
+
+**Parallel builds:** Multiple workers build different submissions at the same time. The number of workers is tuned so builds don't fight over CPU (typically 3-4 on an 8-core machine).
+
+### Step 3 — Run the Benchmark (`bot-fleet`, C++)
+
+Once the server is running, the sandbox-manager tells the bot-fleet to start testing it. There are **two phases:**
+
+**Phase 1 — Correctness (is the matching logic right?)**
+- 1 bot, fixed random seed, deterministic order sequence
+- Every order and every response is recorded
+- These recordings are later replayed through a trusted "golden model" to check if the server matched orders correctly
+
+**Phase 2 — Performance (how fast is it?)**
+- 100+ bots sending orders concurrently
+- Measures throughput (requests per second) and latency
+- Latency is recorded in a histogram with 18 buckets (from 0.05ms to 1000ms)
+- Timeouts are counted separately — they don't go into the histogram (otherwise they'd pollute the P99)
+
+**How bots are assigned to CPU cores:**
+
+Each bot-fleet machine has a "core partition manager" — a simple bitset that tracks which CPU cores are free. When a benchmark starts, it claims 2+ dedicated cores. This means two benchmarks running on the same machine never share CPU cores, so latency measurements stay accurate.
+
+**Scaling to multiple machines:**
+
+The sandbox-manager has a "fleet pool" that knows about multiple bot-fleet machines. When dispatching a benchmark, it picks the machine with the most free capacity. To add more capacity, just add more machines to the `FLEET_POOL_URLS` list — no code changes needed.
+
+### Step 4 — Stream Results to Kafka (`telemetry-ingester`)
+
+Every 500ms, each bot thread sends a batch of data via gRPC:
+- **Order intents** — what orders the bot sent (BUY AAPL @ 100, qty 50)
+- **Trade fills** — what the server reported back (filled against order X at price Y)
+- **Metrics** — request counts, latency histogram
+
+The telemetry-ingester converts these from protobuf to JSON and publishes them to Redpanda (Kafka) topics. The key is the `submission_id`, so all events for one submission land on the same Kafka partition and stay in order.
+
+### Step 5 — Check Correctness and Compute Score (`artifact-checker`)
+
+This is the brain of the system. It has 4 stages:
+
+**Stage 1 — Watermark Processor (reorder events)**
+
+Bot threads run independently, so their events can arrive out of order (by up to ~2 seconds). The watermark processor uses a min-heap to hold events and only releases them once it's safe — when the watermark (= latest timestamp - 2 seconds) passes them.
+
+If no events arrive for 30 seconds, it force-flushes everything. This handles the case where the bot-fleet crashes and the "end of run" marker never arrives — without this, the submission would stay stuck as `UNVERIFIED` forever.
+
+**Stage 2 — Replay Engine (golden-model check)**
+
+Takes the ordered event stream and replays every order through a trusted matching engine built into the checker. For each order, it compares:
+- Did the server fill the right quantity? (exact match)
+- Did it pick the right counterparty? (price-time priority)
+- Is the execution price reasonable? (within the valid range, not exact — different servers may report maker-price vs taker-price, both are valid)
+
+If something doesn't match → `INCORRECT`. If data is missing → `UNVERIFIED` (never a false failure). If everything matches → `CORRECT`.
+
+**Stage 3 — Aggregator (compute performance score)**
+
+Merges metrics from all bot threads:
+- TPS = successful requests in this window / elapsed seconds
+- P50, P90, P99 latency from the histogram
+
+Also receives the correctness verdict and attaches it to the score.
+
+**Stage 4 — Publisher (save and broadcast)**
+
+Writes the score to Postgres and publishes it to Redis for the leaderboard.
+
+### Step 6 — Live Leaderboard (`leaderboard-service`)
+
+**When a browser connects:**
+- Loads the current leaderboard from Postgres
+- Opens a WebSocket connection
+
+**When a new score arrives:**
+- Redis subscriber receives it
+- Server renders just the one table row as HTML: `<tr id="row-abc" hx-swap-oob="true">...</tr>`
+- Sends it over WebSocket to all connected browsers
+- HTMX finds the row by ID and replaces it — the rest of the page doesn't change
+
+This means the leaderboard updates in real-time with no page refresh and no frontend JavaScript framework.
+
+---
+
+## Status Lifecycle
+
+```
+PENDING → BUILDING → READY → RUNNING → SUCCESS
+                                ├── FAILED_SYSTEM    (build failed)
+                                ├── FAILED_STARTUP   (server didn't start)
+                                ├── FAILED_RESOURCE  (out of memory)
+                                └── FAILED_LOGIC     (crash / segfault)
+```
+
+---
+
+## How It Scales
+
+| What | How |
+|---|---|
+| Many submissions at once | Worker pool builds multiple Docker images in parallel |
+| Many benchmarks at once | Fleet pool dispatches across multiple bot-fleet machines, each with dedicated CPU cores |
+| Many events | Kafka partitioned by submission. One processing goroutine per active submission. |
+| Many viewers | WebSocket hub broadcasts to all browsers. Redis pub/sub decouples scoring from viewing. |
+
+To scale horizontally, add more bot-fleet machines:
+```yaml
+FLEET_POOL_URLS: "http://fleet-1:7070,http://fleet-2:7070,http://fleet-3:7070"
+```
+
+---
+
+## Bugs Found and Fixed
+
+| Bug | What went wrong | Fix |
 |---|---|---|
-| 1 | `handler.go` | Reads `X-API-Key` header, queries `teams WHERE api_key = $1` |
-| 2 | `handler.go` | Parses multipart form (32MB in-memory buffer) |
-| 3 | `storage.go` | Streams archive directly to **MinIO** at key `{team_id}/{submission_id}/{filename}` — no temp disk write |
-| 4 | `db.go` | `INSERT INTO submissions (id, team_id, language, status='PENDING', storage_key)` |
-| 5 | `queue.go` | `RPUSH submission_queue {submission_id}` (Redis) |
-| 6 | `handler.go` | Returns HTTP 202 `{"submission_id": "...", "status": "PENDING"}` |
-
-The response is instant. All heavy work is asynchronous.
+| Stuck verdict | If bot-fleet crashed, the "end of run" signal never arrived → verdict stayed `UNVERIFIED` forever | Added a 30-second idle timer — if no events arrive for 30s, flush everything |
+| Early container removal | Cleanup timer started from when we *tried* to dispatch, not from when it *actually started*. If dispatch was delayed, the container was removed too early → wrong scores | Cleanup now waits for a confirmation signal from the dispatch goroutine before starting the countdown |
+| Leaked goroutines | Performance dispatch retried forever with no timeout if fleet was full | Added a 10-minute hard deadline |
+| Ghost orders | 1-second timeout in correctness mode was too tight. A 1.1s response meant the bot moved on, but the server had already processed the order → shadow engine thought the order didn't exist → false `INCORRECT` | Changed to 5-second timeout in correctness mode (1s stays for performance mode) |
 
 ---
 
-## Phase 2 — Sandboxing (`sandbox-manager`)
+## Redis vs Redpanda — Why Both?
 
-**Trigger:** Redis `submission_queue` has a new item.
+Redis and Redpanda do completely different jobs in this system. Here's every place each one is used, why it was picked, and why you can't swap them.
 
-The sandbox-manager runs a **bounded worker pool**: one dispatcher goroutine does all `BLPOP` calls, pushes IDs into a buffered channel (capacity = `workerCount`). Worker goroutines pull from the channel. If all workers are busy, the dispatcher blocks — preventing unbounded goroutine growth.
+### What is Redis used for?
 
-**Inside `process()` for one submission:**
+Redis is an **in-memory key-value store**. It's extremely fast (sub-millisecond) but doesn't store large amounts of data or replay history. We use it for 3 things:
 
-### Step 1 — BUILDING
-```
-status → BUILDING
-Download archive from MinIO → /tmp/veltrix-build-*/submission.archive
-```
-
-### Step 2 — Extract (safely)
-`archive.Extract()` with hard limits:
-- Max total bytes extracted
-- Max single file size
-- Max file count
-
-This prevents zip bomb attacks.
-
-### Step 3 — Build Docker image
-A Dockerfile is **rendered in code** based on `language`:
+**1. Job Queue (`submission_queue`)**
 
 ```
-cpp  → Ubuntu 22.04 + g++ + cmake → cmake build → must produce ./build/server
-rust → rust:1.78-slim             → cargo build  → must produce ./target/release/server
-go   → golang:1.22                → go build      → must produce ./server
+submission-service  →  RPUSH submission_queue "sub-abc"   (add job)
+sandbox-manager     →  BLPOP submission_queue             (wait for job)
 ```
 
-Build timeout: **10 minutes**. Any failure → `status = FAILED_SYSTEM`.
+When a contestant uploads code, the submission-service pushes the submission ID into a Redis list. The sandbox-manager blocks on `BLPOP` (blocking pop) — it sleeps until a job appears, then immediately picks it up.
 
-### Step 4 — Run the container
-```go
-// Resource limits enforced by Docker:
-Memory:      512MB
-NanoCPUs:    1 core (1e9 nanocpus)
-PidsLimit:   1000
-CapDrop:     ALL
-SecurityOpt: no-new-privileges:true
-NetworkMode: sandboxNetwork (isolated)
+> **Why Redis?** We just need a simple FIFO queue. The message is tiny (just a submission ID string). We don't need to replay old messages or keep history. Redis lists with RPUSH/BLPOP give us a reliable queue with zero setup — no topics, no partitions, no consumer groups.
+
+**2. Live Leaderboard Updates (`leaderboard_updates` pub/sub channel)**
+
+```
+artifact-checker    →  PUBLISH leaderboard_updates '{"submission_id":"abc","tps":4500}'
+leaderboard-service →  SUBSCRIBE leaderboard_updates   (receives it instantly)
 ```
 
-The container **must bind to port 9999** within 15 seconds, or it's killed → `FAILED_STARTUP`.
+When the artifact-checker computes a new score, it publishes it to a Redis pub/sub channel. The leaderboard-service is subscribed — it receives the message instantly, renders an HTML table row, and pushes it to all browsers over WebSocket.
 
-### Step 5 — READY + trigger bot-fleet
+> **Why Redis?** Pub/sub is fire-and-forget — we want the leaderboard to update *right now*. If the leaderboard-service was down when a score was published, that's fine — when it comes back up, it loads the full state from Postgres anyway. We don't need message history or replay. Redis pub/sub gives us sub-millisecond delivery with no overhead.
+
+**3. Leaderboard Snapshot (`leaderboard_state` hash)**
+
 ```
-status → READY
-endpoint_url = "http://sandbox-{submission_id}:9999"
-
-→ HTTP POST bot-fleet:7070/benchmark {submission_id, target_host, num_bots, duration_secs}
-→ PUBLISH bot_fleet_triggers (Redis Pub/Sub — for any other subscribers)
-
-status → RUNNING
+artifact-checker    →  HSET leaderboard_state "sub-abc" '{"tps":4500,"p99":1.2}'
+leaderboard-service →  HGETALL leaderboard_state   (on new browser connect)
 ```
 
-### Step 6 — Scheduled cleanup
-After `duration_secs + 300s`, a goroutine:
-- Sets `status = SUCCESS` (if still RUNNING)
-- Calls `docker stop` + `docker rm` + removes the image
+When a browser first connects to the leaderboard, the service needs the current state for ALL submissions — not just future updates. The `leaderboard_state` hash stores the latest score for each submission ID, so the leaderboard-service can read the whole thing in one call.
+
+> **Why Redis?** It's a simple key-value lookup — "give me the current score for every submission." We update it in a pipeline together with the pub/sub publish (both in one Redis roundtrip). Redis hashes are perfect for this — fast reads, no schema needed.
 
 ---
 
-## Phase 3 — Benchmarking (`bot-fleet`, C++)
+### What is Redpanda used for?
 
-**Trigger:** `FleetCommander` receives the HTTP POST on `/benchmark`.
+Redpanda is a **Kafka-compatible event streaming platform**. It stores messages on disk in ordered logs (topics) and lets consumers read them at their own pace, replay from any offset, and work in consumer groups.
 
-The C++ bot-fleet spawns N `ThreadWorker` goroutines (actually C++ async tasks). Each thread independently hammers the contestant's sandbox:
+We use it for one thing — but it's the most data-heavy part of the system:
 
-### The per-thread hot loop
+**Telemetry Event Streaming (`order_events` + `order_metrics` topics)**
+
 ```
-1. Construct an order (BUY/SELL/CANCEL) based on market-making strategy
-2. Log the *intent* in AuditLog:
-       orders_.push_back({timestamp, submission_id, bot_id, order_id, side, price, qty})
-3. Send HTTP POST to sandbox:9999
-4. Parse the JSON response (fills array)
-5. For each fill:
-       log_trade(..., aggressor_order_id = last.order_id)
-                           ↑ this is the bot-generated ID, not the server's ID
-6. record() the outcome:
-       - HTTP 200 → increment http200, record latency into HDR histogram
-       - Timeout  → increment TIMEOUT counter ONLY (no histogram entry)
-       - 4xx/5xx  → increment respective counter
+telemetry-ingester  →  Produce to "order_events" (every order intent + fill)
+                    →  Produce to "order_metrics" (latency histograms)
+
+artifact-checker    →  Consume from both topics (fan-out by submission_id)
 ```
 
-### Every 500ms — AuditBatch flush
-Each thread sends a gRPC `AuditBatch` to `telemetry-ingester:8091`:
-```protobuf
-message AuditBatch {
-  repeated OrderSubmitted orders  = 1;  // intents from this window
-  repeated TradeExecuted  trades  = 2;  // fills, each with aggressor_order_id
-  MetricsBatch            metrics = 3;  // HDR histogram + counters
-}
-```
+During a benchmark, every bot thread sends data every 500ms. With 100 bots, that's 200 messages/second for a single submission. With 10 submissions running, that's 2000 messages/second — each containing arrays of order intents, trade fills, and latency histograms. This is a high-throughput stream.
 
-The batch is **gzip-compressed** before sending.
+> **Why Redpanda (Kafka) and not Redis?**
+> 
+> - **Volume**: Thousands of events per second, each with detailed order data. Redis pub/sub would drop messages if the consumer falls behind — there's no buffer. Kafka stores everything on disk.
+> - **Consumer groups**: The artifact-checker uses a Kafka consumer group. If it crashes and restarts, it resumes from where it left off — no lost events. Redis pub/sub has no memory — if you weren't listening, the message is gone.
+> - **Ordering per submission**: Kafka key = `submission_id`. All events for one submission go to the same partition, so they arrive in order. The artifact-checker needs events in order to do the golden-model replay correctly.
+> - **Replay**: If we need to debug a correctness verdict, we can replay the Kafka topic from the beginning. Redis pub/sub is fire-and-forget — once delivered, it's gone.
+> - **Backpressure**: If the artifact-checker is slow, Kafka holds the messages. The telemetry-ingester keeps producing without blocking. With Redis pub/sub, slow consumers just miss messages.
 
 ---
 
-## Phase 4 — Telemetry Ingestion (`telemetry-ingester`)
+### Side-by-Side: Why you can't swap them
 
-**Protocol:** gRPC client-streaming. One stream per thread, one `AuditBatch` every 500ms.
-
-The ingester translates each batch into **JSON events on Redpanda (Kafka)**:
-
-### OrderSubmitted → `order_events` topic
-```json
-{
-  "submission_id": "abc-123",
-  "event_timestamp": 1719730000000000,
-  "order_id": "42-7",
-  "action": "BUY",
-  "price": 100.5,
-  "volume": 10
-}
-```
-> **Note:** the action is mapped from `side` (BUY/SELL) or kept as `CANCEL`.
-
-### TradeExecuted → `order_events` topic (same topic, action = FILL)
-```json
-{
-  "submission_id": "abc-123",
-  "event_timestamp": 1719730000001000,
-  "order_id": "98765432",
-  "action": "FILL",
-  "matched_order_id": "11111111",
-  "execution_price": 100.5,
-  "volume": 10,
-  "aggressor_order_id": "42-7"   ← join key back to the intent
-}
-```
-
-### MetricsBatch → `order_metrics` topic
-```json
-{
-  "submission_id": "abc-123",
-  "thread_id": 3,
-  "http_200": 847,
-  "timeout": 2,
-  "hist": [0,0,12,145,390,200,80,15,5,0,0,0,0,0,0,0,0,0]
-}
-```
-
-Kafka key = `submission_id` → all events for one submission land on the same partition, preserving order within a submission.
-
----
-
-## Phase 5 — Artifact Checking (`artifact-checker`)
-
-This is where correctness and performance are computed. The pipeline is:
-
-```
-Redpanda topics
-    │
-    ▼
-Consumer (fan-in)
-    │  Two channels: events chan OrderEvent
-    │                metrics chan MetricsBatch
-    ▼
-Router (fan-out)
-    │  Demuxes by submission_id
-    │  One per-submission channel per active submission
-    ▼
-Watermark Processor (per submission)
-    │  Min-heap ordered by EventTimestamp
-    │  Watermark = MaxSeenTimestamp - 2000ms
-    │  Holds events until they're safely behind the watermark
-    │  → emits in event-time order to Shadow Engine
-    ▼
-Shadow Engine (per submission) ←──── validates correctness
-    │  Two-phase intent/fill model (see below)
-    │  Emits CorrectnessUpdate {submission_id, is_correct}
-    ▼
-Aggregator (shared)
-    │  Merges MetricsBatch from all threads + CorrectnessUpdate
-    │  Flushes every interval → Score {TPS, P50, P90, P99, correct}
-    ▼
-Publisher
-    │  async INSERT → Postgres leaderboard_metrics
-    └─ pipeline → Redis HSET + PUBLISH
-```
-
-### Watermark Processor — why it exists
-Multiple bot threads produce events with their own local clocks. Network jitter and OS scheduling means events can arrive at the Kafka consumer out of order by up to ~2 seconds. The watermark processor holds events in a **min-heap** until the watermark advances past them, ensuring the Shadow Engine always sees events in event-time order.
-
-### Shadow Engine — how it validates
-
-**Two event types:**
-
-| Event | Action value | What it represents |
-|---|---|---|
-| Intent | BUY \| SELL \| CANCEL | What the bot asked the exchange to do |
-| Fill | FILL | What the exchange actually did |
-
-**On Intent (BUY/SELL):**
-```
-→ validate the order fields (non-zero qty, etc.)
-→ snapshot top-of-book price at this moment (bestOpposing)
-→ store: intents[event.OrderID] = &intent{side, limitPrice, submittedQty, bestOpposing}
-→ apply to reference order book (for state tracking)
-```
-
-**On Fill:**
-```
-→ look up: intent = intents[event.AggressorOrderID]
-→ if not found: TOLERATE (telemetry gap — no false positives)
-→ Volume check: filled[aggressor] + qty <= intent.submittedQty
-→ Limit-price check:
-    BUY:  execution_price <= limit_price
-    SELL: execution_price >= limit_price
-→ (if STRICT_PRICE_TIME_PRIORITY=true):
-    compare execution_price vs intent.bestOpposing
-→ if any check fails: emit is_correct=false
-```
-
-### Aggregator — how it scores
-
-Every flush interval:
-```
-TPS = http200Delta / elapsed_seconds   (delta since last flush, not all-time)
-
-Percentile calculation:
-  PercentileBucketIndex(histogram, 99)
-    → finds the HDR bucket containing the 99th percentile observation
-  PercentileMs(histogram, 99)
-    → maps that bucket index to ms using BucketUpperBoundsMs[18 entries]
-
-Score { TPS, P50Ms, P90Ms, P99Ms, Correct }
-```
-
-The 18 HDR bucket upper bounds (in ms):
-```
-0.050, 0.100, 0.250, 0.500, 0.750, 1.000, 2.000, 3.000,
-5.000, 7.500, 10.000, 15.000, 25.000, 50.000, 100.000, 250.000,
-500.000, 1000.000
-```
-
----
-
-## Phase 6 — Publisher (artifact-checker → Redis + Postgres)
-
-On each score flush:
-
-### Postgres (async)
-```sql
-INSERT INTO leaderboard_metrics (time, team_id, tps, p50_latency_ms, p90_latency_ms, p99_latency_ms, is_correct)
-VALUES (NOW(), $1, $2, $3, $4, $5, $6)
-```
-This is a time-series append. A BRIN index on `(team_id, time DESC)` makes range queries fast.
-
-### Redis (synchronous pipeline, 2s timeout)
-```
-HSET leaderboard_state {submission_id} {JSON payload}
-PUBLISH leaderboard_updates {JSON payload}
-```
-
-`leaderboard_state` is a hash — the full current state for all submissions. Any new browser that connects can read the whole thing at once.
-
----
-
-## Phase 7 — Leaderboard UI (`leaderboard-service`)
-
-### On browser connect (`GET /`)
-1. Browser loads `base.html`
-2. HTMX fires `GET /leaderboard` immediately (`hx-trigger="load"` on `<tbody>`)
-3. Handler calls `fetchCurrentLeaderboard()`:
-   ```sql
-   SELECT DISTINCT ON (lm.team_id) ... FROM leaderboard_metrics lm
-   ORDER BY lm.team_id, lm.time DESC
-   ```
-   Then sorted in Go: **TPS desc, P99 asc** as tiebreaker
-4. `table.html` template rendered → full table HTML returned to browser
-
-### On WebSocket connect (`GET /ws/leaderboard`)
-1. Browser upgrades to WebSocket
-2. Server immediately fetches `fetchCurrentLeaderboard()` and sends each row as a rendered `row.html` HTMX fragment
-3. Client is registered in the Hub
-
-### Real-time updates
-```
-artifact-checker publishes to Redis channel "leaderboard_updates"
-    ↓
-RedisSubscriber.Listen() receives the JSON payload
-    ↓
-Renders row.html template: <tr id="row-{submission_id}" hx-swap-oob="true">...</tr>
-    ↓
-Hub.broadcast() → all connected WebSocket clients
-    ↓
-Browser receives the HTML fragment
-HTMX OOB swap updates only the affected <tr> in the table
-```
-
-The `hx-swap-oob="true"` attribute on the `<tr>` tells HTMX to find the element by its ID in the existing DOM and replace it in-place — the rest of the page is untouched.
-
----
-
-## Submission Status State Machine
-
-```
-PENDING
-  │  (sandbox-manager picks up the job)
-  ▼
-BUILDING
-  │  (docker build succeeds)
-  ▼
-READY
-  │  (bot-fleet triggered)
-  ▼
-RUNNING ───────────────────────────────────────► SUCCESS
-  │                                              (after benchmark window + 5min)
-  ├──► FAILED_SYSTEM   (build error, docker error)
-  ├──► FAILED_STARTUP  (port 9999 never opened)
-  ├──► FAILED_RESOURCE (OOM killed, exit 137)
-  └──► FAILED_LOGIC    (segfault, exit 139)
-```
-
----
-
-## Data Stores and Their Roles
-
-| Store | What lives there | Who reads | Who writes |
+| Feature needed | Redis | Redpanda (Kafka) | Used where |
 |---|---|---|---|
-| **Postgres** `submissions` | Status, endpoint_url, error, storage_key | submission-service, sandbox-manager, leaderboard-service | submission-service (insert), sandbox-manager (status updates) |
-| **Postgres** `teams` | Team names, API keys | submission-service | seeded at startup |
-| **Postgres** `leaderboard_metrics` | Time-series TPS/latency rows per submission | leaderboard-service | artifact-checker publisher |
-| **MinIO** | Contestant archive files | sandbox-manager | submission-service |
-| **Redis** `submission_queue` | Pending submission IDs (RPUSH/BLPOP) | sandbox-manager | submission-service |
-| **Redis** `bot_fleet_triggers` | Pub/Sub benchmark trigger | bot-fleet (optional subscriber) | sandbox-manager |
-| **Redis** `leaderboard_state` | Hash: latest score per submission_id | leaderboard-service (on WS connect) | artifact-checker publisher |
-| **Redis** `leaderboard_updates` | Pub/Sub: live score updates | leaderboard-service subscriber | artifact-checker publisher |
-| **Redpanda** `order_events` | JSON order events (intents + fills) | artifact-checker consumer | telemetry-ingester |
-| **Redpanda** `order_metrics` | JSON metrics batches | artifact-checker consumer | telemetry-ingester |
+| Simple job queue (push/pop) | ✅ RPUSH/BLPOP — perfect | ❌ Overkill, needs topics + consumer groups just for one ID | `submission_queue` |
+| Fire-and-forget notifications | ✅ Pub/sub — instant, zero setup | ❌ Would need a consumer group, offset tracking — too heavy for "ping the UI" | `leaderboard_updates` |
+| Key-value snapshot | ✅ HSET/HGETALL — perfect | ❌ Kafka is an append-only log, not a key-value store | `leaderboard_state` |
+| High-throughput ordered stream | ❌ Pub/sub drops messages if consumer is slow, no replay | ✅ On-disk log, consumer groups, replay, partitioned by key | `order_events`, `order_metrics` |
+| Crash recovery (resume from where you left off) | ❌ Pub/sub is fire-and-forget | ✅ Consumer group offsets survive restarts | artifact-checker consuming telemetry |
+| Per-submission ordering | ❌ No built-in partitioning | ✅ Kafka key = submission_id → same partition → ordered | Correctness replay needs ordered events |
+
+### In short
+
+- **Redis** = fast, simple, ephemeral. Jobs, notifications, snapshots. Small data, instant delivery, no need for history.
+- **Redpanda** = durable, ordered, replayable. High-volume event streams where losing a message means a wrong verdict.
 
 ---
 
-## Network Topology (Docker Compose)
+## Docker Network Layout
 
 ```
-External (host)
-  :8080  → submission-service
-  :8085  → leaderboard-service (browser)
-  :9000  → MinIO (S3 API)
-  :9090  → MinIO Console
-  :9092  → Redpanda (Kafka)
-  :9644  → Redpanda Admin
+Public ports:
+  :8080  → submission-service (contestants upload here)
+  :8085  → leaderboard-service (browsers connect here)
 
-Internal (veltrix_net)
-  submission-service   ←→  postgres, redis, minio
-  sandbox-manager      ←→  postgres, redis, minio, docker socket, bot-fleet
-  bot-fleet            ←→  sandbox containers (sandbox_net), telemetry-ingester
-  telemetry-ingester   ←→  redpanda
-  artifact-checker     ←→  redpanda, postgres, redis
-  leaderboard-service  ←→  postgres, redis
+Internal network (services talk to each other):
+  submission-service ←→ postgres, redis, minio
+  sandbox-manager    ←→ postgres, redis, minio, docker, bot-fleet
+  bot-fleet          ←→ contestant containers, telemetry-ingester
+  telemetry-ingester ←→ redpanda
+  artifact-checker   ←→ redpanda, postgres, redis
+  leaderboard        ←→ postgres, redis
 
-sandbox_net (isolated)
-  sandbox-{uuid}       ←→  bot-fleet only
-  (no internet access from contestant containers)
+Isolated network (contestant containers):
+  sandbox-{id} ←→ bot-fleet ONLY (no internet, no access to other services)
 ```

@@ -314,6 +314,70 @@ func TestReplayUnverifiedInputs(t *testing.T) {
 	})
 }
 
+// TestReplayLostResponseIsUnverifiedNotIncorrect is the regression for the ghost
+// order trap: a single response lost to a network timeout (seq burned, no event
+// emitted) leaves the aggressor that consumed liquidity uncaptured, so the golden
+// model still sees the resting order and expects a fill a later, fully correct
+// order could not produce. Before the sequence-gap check this returned a false
+// INCORRECT; a lost order must be Unverified, never a failure.
+func TestReplayLostResponseIsUnverifiedNotIncorrect(t *testing.T) {
+	events := []models.OrderEvent{
+		intent(1, "S1", "SELL", "LIMIT", "AAA", 100, 10, 1), // rests ask 100
+		// seq 2: BUY 10@100 ate S1 on the server, but the response timed out — no
+		// intent, no fill recorded. Only the seq is burned, leaving a gap {1,3}.
+		intent(3, "B3", "BUY", "LIMIT", "AAA", 100, 10, 3), // real book empty → no fill
+	}
+	v, reason := Replay(events)
+	if v != models.VerdictUnverified {
+		t.Fatalf("lost response must be Unverified, got %s (reason=%q)", v, reason)
+	}
+	if !strings.Contains(reason, "sequence gap") {
+		t.Fatalf("reason %q should cite the sequence gap", reason)
+	}
+}
+
+// withOutcome stamps an attempt outcome onto an intent event.
+func withOutcome(outcome string, ev models.OrderEvent) models.OrderEvent {
+	ev.Outcome = outcome
+	return ev
+}
+
+// TestReplayRejectedOrderIsNoOp proves a cleanly-rejected order (4xx) is treated
+// as a book no-op: it never entered the server's book, so the golden model must
+// not expect a fill from it. The seq stays contiguous (no gap → no false
+// Unverified) and a correct contestant stays Correct. Contrast: the same BUY
+// without the REJECTED tag would cross S1 and expect a fill the contestant never
+// reported → Incorrect.
+func TestReplayRejectedOrderIsNoOp(t *testing.T) {
+	events := []models.OrderEvent{
+		intent(1, "S1", "SELL", "LIMIT", "AAA", 100, 10, 1), // rests ask 100
+		// seq 2: BUY 10@100 was rejected by the server (4xx) — never entered the book.
+		withOutcome("REJECTED", intent(2, "B1", "BUY", "LIMIT", "AAA", 100, 10, 2)),
+	}
+	v, reason := Replay(events)
+	if v != models.VerdictCorrect {
+		t.Fatalf("rejected order must be a no-op, got %s (reason=%q)", v, reason)
+	}
+}
+
+// TestReplayUnknownOutcomeIsUnverified proves an attempt whose outcome the bot
+// could not determine (timeout / 5xx / unparsable response) forces Unverified:
+// the server may have applied it, so the book cannot be trusted — never a false
+// Incorrect.
+func TestReplayUnknownOutcomeIsUnverified(t *testing.T) {
+	events := []models.OrderEvent{
+		intent(1, "S1", "SELL", "LIMIT", "AAA", 100, 10, 1),
+		withOutcome("UNKNOWN", intent(2, "B1", "BUY", "LIMIT", "AAA", 100, 10, 2)),
+	}
+	v, reason := Replay(events)
+	if v != models.VerdictUnverified {
+		t.Fatalf("unknown outcome must be Unverified, got %s (reason=%q)", v, reason)
+	}
+	if !strings.Contains(reason, "unknown outcome") {
+		t.Fatalf("reason %q should cite the unknown outcome", reason)
+	}
+}
+
 // TestReplayScriptedScenario exercises every order-type path in one deterministic
 // sequence with a hand-computed correct contestant, guaranteeing coverage that a
 // random single-bot run would only hit by chance.

@@ -238,6 +238,7 @@ func Replay(events []models.OrderEvent) (models.Verdict, string) {
 	expected := make(map[string]*aggressorExpectation)
 	observed := make(map[string][]observedFill)
 	var aggressorOrder []string // bot order_ids of intents, in seq order
+	var maxSeq uint64           // highest seq seen — the end-of-run marker in a complete run
 
 	for _, ev := range sorted {
 		if ev.Seq != 0 {
@@ -245,8 +246,28 @@ func Replay(events []models.OrderEvent) (models.Verdict, string) {
 				continue
 			}
 			seen[ev.Seq] = struct{}{}
+			if ev.Seq > maxSeq {
+				maxSeq = ev.Seq
+			}
 		}
 		if ev.EndOfRun {
+			continue
+		}
+
+		// Attempt outcome (stamped by the bot on every intent) decides whether this
+		// order is trustworthy input. Its seq is already counted above, so a rejected
+		// order keeps the stream contiguous without polluting the golden model.
+		switch strings.ToUpper(strings.TrimSpace(ev.Outcome)) {
+		case "UNKNOWN":
+			// The bot never learned what the server did (timeout, 5xx, or an
+			// unparsable response). The server may have mutated its book, so the
+			// golden model can no longer be trusted against reality — fail safe.
+			return models.VerdictUnverified, fmt.Sprintf(
+				"order_id=%s (seq=%d) had an unknown outcome (timeout/5xx/unparsable response) — the server may have applied it, so the book cannot be verified",
+				ev.OrderID, ev.Seq)
+		case "REJECTED":
+			// Cleanly rejected by the server (4xx): it never entered the book. Skip
+			// it as a no-op; its seq already counts toward sequence continuity.
 			continue
 		}
 
@@ -289,6 +310,25 @@ func Replay(events []models.OrderEvent) (models.Verdict, string) {
 				price:      toTick(ev.ExecutionPrice),
 			})
 		}
+	}
+
+	// Stream completeness by sequence continuity. Every correctness order reserves
+	// a monotonic seq (from 1) BEFORE the request is sent; a lost response — a
+	// timeout, a read/connection error, or a 200 whose order_id could not be parsed
+	// — burns that seq but records no event, leaving a hole. Trades and the
+	// end-of-run marker draw from the same counter and are always emitted, so a
+	// complete run's seqs are exactly {1..maxSeq} with no gap. A gap means an order
+	// reached the server (mutating its book) yet we never captured it: from that
+	// point the golden model replays a different book than the contestant actually
+	// faced, which can surface as a false "incorrect" on a fully correct engine
+	// (e.g. a lost aggressor that consumed liquidity the golden model still sees).
+	// Missing input can never yield a trustworthy verdict, so report Unverified —
+	// never a false failure (the paramount constraint). This also catches events
+	// dropped anywhere in the telemetry pipeline, not just bot-side request losses.
+	if maxSeq > 0 && uint64(len(seen)) != maxSeq {
+		return models.VerdictUnverified, fmt.Sprintf(
+			"captured stream has a sequence gap: %d distinct events but seq runs to %d — an order was lost in flight (incomplete telemetry)",
+			len(seen), maxSeq)
 	}
 
 	// A fill whose aggressor never submitted an intent means the captured stream

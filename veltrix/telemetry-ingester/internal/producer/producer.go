@@ -55,6 +55,10 @@ type OrderEventJSON struct {
 	ExecutionPrice    float64 `json:"execution_price,omitempty"`
 	AggressorOrderID  string  `json:"aggressor_order_id,omitempty"`
 	EndOfRun          bool    `json:"end_of_run,omitempty"`
+	// Outcome tags an intent's attempt result so a lost/rejected response is not a
+	// silent seq gap: "" (OK), "REJECTED" (clean 4xx, replay no-op), "UNKNOWN"
+	// (timeout/5xx/parse error, forces Unverified). Only present on intents.
+	Outcome string `json:"outcome,omitempty"`
 }
 
 // MetricsJSON is the JSON shape consumed by the Go artifact-checker aggregator.
@@ -98,6 +102,20 @@ func New(cfg Config) (*Producer, error) {
 	}, nil
 }
 
+// outcomeString maps the protobuf outcome enum (0=OK, 1=REJECTED, 2=UNKNOWN) to
+// the string the checker consumes. OK maps to "" so it is omitted for the common
+// case and read as the default OK verdict input downstream.
+func outcomeString(outcome int32) string {
+	switch outcome {
+	case 1:
+		return "REJECTED"
+	case 2:
+		return "UNKNOWN"
+	default:
+		return ""
+	}
+}
+
 // PublishOrderEvents converts protobuf OrderSubmitted messages into JSON
 // OrderEvent records and publishes them to the order_events topic.
 func (p *Producer) PublishOrderEvents(orders []*pb.OrderSubmitted) {
@@ -122,6 +140,7 @@ func (p *Producer) PublishOrderEvents(orders []*pb.OrderSubmitted) {
 			ContestantOrderID: order.ContestantOrderId,
 			CancelTargetID:    order.CancelTargetId,
 			EndOfRun:          order.EndOfRun,
+			Outcome:           outcomeString(order.Outcome),
 		}
 
 		data, err := json.Marshal(event)

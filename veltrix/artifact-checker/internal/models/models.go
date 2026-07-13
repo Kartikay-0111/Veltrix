@@ -50,6 +50,16 @@ type OrderEvent struct {
 	// EndOfRun marks the sentinel event the correctness-run writer emits when the
 	// serialized order stream is complete, letting the engine finalize the verdict.
 	EndOfRun bool `json:"end_of_run,omitempty"`
+
+	// Outcome is the attempt result the bot stamps on every intent so a lost or
+	// rejected response is never a silent hole in the seq stream:
+	//   "" / "OK"   — clean 200, the server applied the order (normal replay).
+	//   "REJECTED"  — clean 4xx, the server rejected it; the book is unchanged, so
+	//                 the golden model treats it as a no-op (seq stays contiguous).
+	//   "UNKNOWN"   — timeout / 5xx / parse error; the server may have applied it,
+	//                 so the book cannot be trusted → the whole run is Unverified.
+	// Only present on intents (BUY/SELL/CANCEL), never on FILL events.
+	Outcome string `json:"outcome,omitempty"`
 }
 
 func (event *OrderEvent) UnmarshalJSON(data []byte) error {
@@ -71,6 +81,7 @@ func (event *OrderEvent) UnmarshalJSON(data []byte) error {
 		ExecutionPrice    float64 `json:"execution_price"`
 		AggressorOrderID  string  `json:"aggressor_order_id"`
 		EndOfRun          bool    `json:"end_of_run"`
+		Outcome           string  `json:"outcome"`
 	}
 
 	var decoded orderEventJSON
@@ -96,6 +107,7 @@ func (event *OrderEvent) UnmarshalJSON(data []byte) error {
 	event.ExecutionPrice = decoded.ExecutionPrice
 	event.AggressorOrderID = decoded.AggressorOrderID
 	event.EndOfRun = decoded.EndOfRun
+	event.Outcome = decoded.Outcome
 
 	return nil
 }

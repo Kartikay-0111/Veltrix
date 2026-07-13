@@ -2,13 +2,12 @@
 #include "rest_bot.hpp"
 #include "grpc_telemetry.hpp"
 #include <boost/asio/buffers_iterator.hpp>
+#include <boost/json.hpp>
 #include <iostream>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <optional>
 #include <pthread.h>
-#include <regex>
 #include <sched.h>
 // Awaitable operator overloads (e.g. a || b)
 #include <boost/asio/experimental/awaitable_operators.hpp>
@@ -17,16 +16,14 @@ using namespace boost::asio::experimental::awaitable_operators;
 using namespace std::chrono_literals;
 
 static std::size_t parse_content_length(const std::string &header);
-static std::optional<double> extract_json_number(const std::string &json,
-                                                 const std::string &key);
-static std::string extract_json_string(const std::string &json,
-                                       const std::string &key);
-static std::string extract_json_scalar(const std::string &json,
-                                       const std::string &key);
 
-// ─── Minimal trades[] array parser ───────────────────────────────────────────
-// Extracts individual trade objects from the JSON trades array in the response.
-// Example input: {"order_id":1,"ticker":"AAPL","trades":[{"buy_order_id":1,"sell_order_id":2,"price":100,"qty":15}]}
+namespace json = boost::json;
+
+// ─── Response parsing (real JSON, not hand-rolled string scanning) ────────────
+// The observation stream is the ground truth for "what the contestant did", so it
+// must be parsed with a conforming JSON reader: nested objects, arrays, scientific
+// notation, and arbitrary whitespace all parse correctly, and a malformed body is
+// detected (parsed == false) instead of silently mis-scanned into a bogus fill.
 struct ParsedTrade
 {
     uint64_t buy_order_id = 0;
@@ -35,59 +32,100 @@ struct ParsedTrade
     int qty = 0;
 };
 
-static std::vector<ParsedTrade> parse_trades_array(const std::string &json)
+struct ParsedResponse
 {
+    bool parsed = false;         // body was a well-formed JSON object
+    bool has_order_id = false;   // a usable (non-zero) server order_id was present
+    uint64_t order_id = 0;
     std::vector<ParsedTrade> trades;
+};
 
-    // Find the "trades" array
-    auto trades_pos = json.find("\"trades\"");
-    if (trades_pos == std::string::npos)
-        return trades;
-
-    auto bracket_start = json.find('[', trades_pos);
-    if (bracket_start == std::string::npos)
-        return trades;
-
-    auto bracket_end = json.find(']', bracket_start);
-    if (bracket_end == std::string::npos)
-        return trades;
-
-    // Extract the array content
-    std::string arr = json.substr(bracket_start + 1, bracket_end - bracket_start - 1);
-    if (arr.empty())
-        return trades;
-
-    // Parse each trade object { ... }
-    std::size_t pos = 0;
-    while (pos < arr.size())
+// Coerce a JSON value that may be a number OR a numeric string into a uint64.
+// Contestant servers vary: some emit order_id as 42, others as "42".
+static uint64_t json_to_u64(const json::value &v)
+{
+    switch (v.kind())
     {
-        auto obj_start = arr.find('{', pos);
-        if (obj_start == std::string::npos)
-            break;
+    case json::kind::int64:
+        return v.get_int64() < 0 ? 0 : static_cast<uint64_t>(v.get_int64());
+    case json::kind::uint64:
+        return v.get_uint64();
+    case json::kind::double_:
+        return static_cast<uint64_t>(v.get_double());
+    case json::kind::string:
+        try { return std::stoull(std::string(v.get_string())); } catch (...) { return 0; }
+    default:
+        return 0;
+    }
+}
 
-        auto obj_end = arr.find('}', obj_start);
-        if (obj_end == std::string::npos)
-            break;
+static double json_to_double(const json::value &v)
+{
+    switch (v.kind())
+    {
+    case json::kind::double_:
+        return v.get_double();
+    case json::kind::int64:
+        return static_cast<double>(v.get_int64());
+    case json::kind::uint64:
+        return static_cast<double>(v.get_uint64());
+    case json::kind::string:
+        try { return std::stod(std::string(v.get_string())); } catch (...) { return 0.0; }
+    default:
+        return 0.0;
+    }
+}
 
-        std::string obj = arr.substr(obj_start, obj_end - obj_start + 1);
+static ParsedResponse parse_response(const std::string &body)
+{
+    ParsedResponse out;
+    if (body.empty())
+        return out;
 
-        ParsedTrade trade;
-        if (auto v = extract_json_number(obj, "buy_order_id"))
-            trade.buy_order_id = static_cast<uint64_t>(*v);
-        if (auto v = extract_json_number(obj, "sell_order_id"))
-            trade.sell_order_id = static_cast<uint64_t>(*v);
-        if (auto v = extract_json_number(obj, "price"))
-            trade.price = *v;
-        if (auto v = extract_json_number(obj, "qty"))
-            trade.qty = static_cast<int>(*v);
-        else if (auto v2 = extract_json_number(obj, "quantity"))
-            trade.qty = static_cast<int>(*v2);
+    json::value root;
+    try
+    {
+        root = json::parse(body);
+    }
+    catch (const std::exception &)
+    {
+        return out; // malformed → parsed stays false (caller treats as unknown)
+    }
+    if (!root.is_object())
+        return out;
 
-        trades.push_back(trade);
-        pos = obj_end + 1;
+    out.parsed = true;
+    const json::object &obj = root.as_object();
+
+    if (const json::value *oid = obj.if_contains("order_id"))
+    {
+        out.order_id = json_to_u64(*oid);
+        out.has_order_id = (out.order_id != 0);
     }
 
-    return trades;
+    if (const json::value *tr = obj.if_contains("trades"); tr && tr->is_array())
+    {
+        for (const json::value &item : tr->as_array())
+        {
+            if (!item.is_object())
+                continue;
+            const json::object &to = item.as_object();
+            ParsedTrade trade;
+            if (const json::value *p = to.if_contains("buy_order_id"))
+                trade.buy_order_id = json_to_u64(*p);
+            if (const json::value *p = to.if_contains("sell_order_id"))
+                trade.sell_order_id = json_to_u64(*p);
+            if (const json::value *p = to.if_contains("price"))
+                trade.price = json_to_double(*p);
+            if (const json::value *p = to.if_contains("qty"))
+                trade.qty = static_cast<int>(json_to_double(*p));
+            else if (const json::value *p2 = to.if_contains("quantity"))
+                trade.qty = static_cast<int>(json_to_double(*p2));
+            out.trades.push_back(trade);
+        }
+    }
+
+    return out;
 }
 
 ThreadWorker::ThreadWorker(int thread_id,
@@ -244,6 +282,35 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
         // between the intent and its server-id attachment.
         const uint64_t order_seq = correctness ? next_seq_++ : 0;
 
+        // Record exactly one order entry per attempt (correctness mode) tagged with
+        // its outcome, so a lost or rejected response is never a silent hole in the
+        // seq stream that the checker would otherwise read as a false verdict.
+        // contestant_order_id is 0 unless the server returned a usable id.
+        auto emit_intent = [&](OrderOutcome outcome, uint64_t contestant_order_id)
+        {
+            if (!correctness)
+                return;
+            uint64_t cancel_target_id = 0;
+            if (last.type == "CANCEL")
+            {
+                try { cancel_target_id = std::stoull(last.order_id); }
+                catch (...) {}
+            }
+            audit_log_.record_order(
+                cfg_.submission_id,
+                static_cast<int32_t>(bot_id),
+                last.order_id,
+                last.type,                                // action = LIMIT | MARKET | CANCEL | FOK | FAK | GFD
+                last.type == "CANCEL" ? "" : last.action, // side = BUY | SELL (empty for CANCEL)
+                last.ticker,
+                last.price,
+                last.quantity,
+                cancel_target_id,
+                order_seq,
+                contestant_order_id,
+                outcome);
+        };
+
         // ── Record start time (nanosecond precision) ──────────────────────────
         auto t0 = std::chrono::steady_clock::now();
 
@@ -281,12 +348,14 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
             catch (const boost::system::system_error &e)
             {
                 ++counters_.counts[OTHER_ERR];
+                emit_intent(OrderOutcome::Unknown, 0); // response lost mid-read
                 continue;
             }
 
             if (timed_out)
             {
                 record(0, 0.0, true); // count as TIMEOUT only — not a latency sample
+                emit_intent(OrderOutcome::Unknown, 0); // server may have applied it
                 continue;
             }
 
@@ -314,6 +383,7 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
                 catch (const boost::system::system_error &e)
                 {
                     ++counters_.counts[OTHER_ERR];
+                    emit_intent(OrderOutcome::Unknown, 0); // body lost mid-read
                     continue;
                 }
             }
@@ -332,78 +402,72 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
             // ── Stream A: latency/throughput metrics ─────────────────────────
             record(status, lat, false);
 
-            // ── Stream B: OBSERVATION — parse and unroll trades ──────────────
-            if (status == 200 && !response_body.empty())
+            // ── Stream B: OBSERVATION — classify outcome, capture ground truth ─
+            if (status == 200)
             {
-                // Extract the server-assigned order_id
-                std::string order_id_text = extract_json_scalar(response_body, "order_id");
-                uint64_t contestant_order_id = 0;
-                if (!order_id_text.empty())
+                ParsedResponse resp = parse_response(response_body);
+                if (!resp.parsed || !resp.has_order_id)
                 {
-                    try { contestant_order_id = std::stoull(order_id_text); }
-                    catch (...) {}
+                    // Server answered 200 but the body could not be parsed or carried
+                    // no usable order_id: it applied *something* we cannot map, so the
+                    // outcome is unknowable → force Unverified downstream.
+                    emit_intent(OrderOutcome::Unknown, 0);
                 }
-
-                // Full audit only in correctness mode — the performance run emits
-                // metrics only, keeping the concurrent stream light.
-                if (correctness)
+                else
                 {
-                    // Record the INTENT now that its server id is known, carrying the
-                    // reserved seq. For CANCEL the target is the server id the bot is
-                    // cancelling (its own order_id string is that id).
-                    uint64_t cancel_target_id = 0;
-                    if (last.type == "CANCEL")
+                    const uint64_t contestant_order_id = resp.order_id;
+                    emit_intent(OrderOutcome::Ok, contestant_order_id);
+
+                    // Unroll each trade from the parsed trades[] array (correctness only —
+                    // the performance run emits metrics only, keeping the stream light).
+                    if (correctness)
                     {
-                        try { cancel_target_id = std::stoull(last.order_id); }
-                        catch (...) {}
+                        for (const auto &trade : resp.trades)
+                        {
+                            // Determine which side is the "matched" resting order.
+                            const uint64_t matched_id = (trade.buy_order_id == contestant_order_id)
+                                                            ? trade.sell_order_id
+                                                            : trade.buy_order_id;
+
+                            audit_log_.record_trade(
+                                cfg_.submission_id,
+                                static_cast<int32_t>(bot_id),
+                                last.ticker,
+                                contestant_order_id,
+                                matched_id,
+                                trade.price,
+                                trade.qty,
+                                last.order_id, // join key: bot-generated aggressor order_id
+                                next_seq_++);
+                        }
                     }
-                    audit_log_.record_order(
-                        cfg_.submission_id,
-                        static_cast<int32_t>(bot_id),
-                        last.order_id,
-                        last.type,                                 // action = LIMIT | MARKET | CANCEL | FOK | FAK | GFD
-                        last.type == "CANCEL" ? "" : last.action,  // side = BUY | SELL (empty for CANCEL)
-                        last.ticker,
-                        last.price,
-                        last.quantity,
-                        cancel_target_id,
-                        order_seq,
-                        contestant_order_id);
 
-                    // Unroll each individual trade from the trades[] array
-                    auto trades = parse_trades_array(response_body);
-                    for (const auto &trade : trades)
-                    {
-                        // Determine which side is the "matched" resting order
-                        uint64_t matched_id = (trade.buy_order_id == contestant_order_id)
-                                                  ? trade.sell_order_id
-                                                  : trade.buy_order_id;
-
-                        audit_log_.record_trade(
-                            cfg_.submission_id,
-                            static_cast<int32_t>(bot_id),
-                            last.ticker,
-                            contestant_order_id,
-                            matched_id,
-                            trade.price,
-                            trade.qty,
-                            last.order_id, // join key: bot-generated aggressor order_id
-                            next_seq_++);
-                    }
-                }
-
-                // Feed server-assigned order IDs back to the bot for cancel flow
-                // (needed in both modes so the bot can generate valid cancels).
-                if (bot.order_type() != OrderType::CANCEL && contestant_order_id > 0)
-                {
-                    bot.record_accepted_order(contestant_order_id);
+                    // Feed server-assigned order IDs back to the bot for the cancel flow
+                    // (needed in both modes so the bot can generate valid cancels).
+                    if (bot.order_type() != OrderType::CANCEL)
+                        bot.record_accepted_order(contestant_order_id);
                 }
             }
+            else if (status >= 400 && status < 500)
+            {
+                // Clean client-side rejection: the server did not apply the order, so
+                // its book is unchanged. Record REJECTED — replay skips it as a no-op
+                // while the seq stays contiguous (no over-conservative Unverified).
+                emit_intent(OrderOutcome::Rejected, 0);
+            }
+            else
+            {
+                // 5xx, a 0/garbage status, or any other non-200: the server may or may
+                // not have applied the order — unknowable → Unverified downstream.
+                emit_intent(OrderOutcome::Unknown, 0);
+            }
+
             response_buf.consume(response_buf.size());
         }
         catch (const boost::system::system_error &e)
         {
             ++counters_.counts[OTHER_ERR];
+            emit_intent(OrderOutcome::Unknown, 0); // request write failed / unexpected
         }
     }
 }
@@ -519,47 +583,4 @@ void ThreadWorker::record(int status_code, double latency_ms, bool timed_out)
         ++counters_.counts[OTHER_ERR];
 
     counters_.record_latency(latency_ms);
-}
-
-static std::optional<double> extract_json_number(const std::string &json,
-                                                 const std::string &key)
-{
-    const std::regex re("\"" + key + "\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
-    std::smatch match;
-    if (!std::regex_search(json, match, re))
-        return std::nullopt;
-
-    try
-    {
-        return std::stod(match[1].str());
-    }
-    catch (...)
-    {
-        return std::nullopt;
-    }
-}
-
-static std::string extract_json_string(const std::string &json,
-                                       const std::string &key)
-{
-    const std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
-    std::smatch match;
-    if (std::regex_search(json, match, re))
-        return match[1].str();
-    return "";
-}
-
-static std::string extract_json_scalar(const std::string &json,
-                                       const std::string &key)
-{
-    auto text = extract_json_string(json, key);
-    if (!text.empty())
-        return text;
-
-    const std::regex re("\"" + key + "\"\\s*:\\s*(-?[0-9]+)");
-    std::smatch match;
-    if (std::regex_search(json, match, re))
-        return match[1].str();
-
-    return "";
 }

@@ -16,6 +16,16 @@
 //   2. TradeExecutedEntry  — Observation: parsed from the HTTP response
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Outcome of a single order attempt. Recorded on every attempt (correctness mode)
+// so a lost or rejected response leaves no silent gap in the seq stream. Values
+// match telemetry.proto OrderSubmitted.outcome exactly (wire is a plain int32).
+enum class OrderOutcome : uint8_t
+{
+    Ok = 0,       // clean 200, server applied the order
+    Rejected = 1, // clean 4xx, server rejected it; book unchanged (replay no-op)
+    Unknown = 2   // timeout / 5xx / connection or parse error; outcome unknowable
+};
+
 struct OrderSubmittedEntry
 {
     int64_t timestamp_us = 0;     // Bot's local clock, epoch microseconds
@@ -31,6 +41,7 @@ struct OrderSubmittedEntry
     uint64_t seq = 0;                 // Monotonic per-submission sequence (replay order + dedup)
     uint64_t contestant_order_id = 0; // Server-assigned ID for this order (captured post-response)
     bool end_of_run = false;          // Sentinel: serialized correctness run complete
+    OrderOutcome outcome = OrderOutcome::Ok; // Attempt outcome (see OrderOutcome)
 };
 
 struct TradeExecutedEntry
@@ -68,7 +79,8 @@ public:
                       int32_t quantity,
                       uint64_t cancel_target_id,
                       uint64_t seq,
-                      uint64_t contestant_order_id)
+                      uint64_t contestant_order_id,
+                      OrderOutcome outcome = OrderOutcome::Ok)
     {
         auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
                           std::chrono::system_clock::now().time_since_epoch())
@@ -76,7 +88,7 @@ public:
 
         orders_.push_back({now_us, submission_id, bot_id, order_id,
                            action, side, ticker, price, quantity, cancel_target_id,
-                           seq, contestant_order_id, false});
+                           seq, contestant_order_id, false, outcome});
     }
 
     // Sentinel marking the end of a serialized correctness run so the checker can
