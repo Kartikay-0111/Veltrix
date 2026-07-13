@@ -18,6 +18,10 @@
 	1. Bot fleet sends `AuditBatch` over gRPC.
 	2. Ingester publishes `order_events` and `order_metrics` records.
 	3. Artifact checker consumes those topics.
+- Records are keyed by `submission_id` (so one submission's events stay in one
+	partition, in order) and carry a JSON value. Intents pass through the per-attempt
+	`outcome` tag (proto enum `0=OK / 1=REJECTED / 2=UNKNOWN`, mapped to the strings
+	`"" / "REJECTED" / "UNKNOWN"`) so the checker can classify lost or rejected orders.
 
 ## Folder Structure
 

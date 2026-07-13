@@ -219,14 +219,32 @@ func (e *Engine) finalize(submissionID string, events []models.OrderEvent) model
 	return models.CorrectnessUpdate{SubmissionID: submissionID, Verdict: verdict, Reason: reason}
 }
 
+// Verdict-policy thresholds, expressed as a fraction of the run's order attempts
+// that could not be verified (an UNKNOWN outcome, a seq gap, an orphan fill, or a
+// fill against an unknown maker). Below the tolerance a clean run is certified
+// Correct; above the unhealthy line the server is flagged as failing to respond.
+const (
+	unknownTolerance   = 0.05 // < 5% unverifiable AND no divergence → Correct
+	unhealthyThreshold = 0.50 // > 50% unverifiable → Unverified (server unhealthy)
+)
+
 // Replay runs the golden model over the submission's events (sorted by seq) and
-// diffs each aggressor order's expected trades against the contestant's reported
-// fills. It returns VerdictCorrect when the contestant conforms, VerdictIncorrect
-// with a reason on the first real divergence, or VerdictUnverified when the input
-// is too incomplete to judge (a fill with no captured intent, or a counterparty
-// that was never submitted) — we never turn missing input into a false failure.
-// Exported for direct unit testing. (Stream completeness — the end-of-run marker
-// — is checked by the caller in finalize, not here.)
+// diffs each aggressor order against the contestant's reported fills, then decides
+// a verdict under a tolerance policy — it does NOT fail on the first blemish, so a
+// handful of transient blips among hundreds of requests cannot sink a correct run:
+//
+//   - A real matching divergence on TRUSTWORTHY (untainted) input is always
+//     Incorrect — one is enough. Real bugs get no tolerance budget (never fail-open).
+//   - Otherwise the fraction of UNVERIFIABLE order attempts decides:
+//     < 5% and nothing diverged → Correct (transient blips tolerated);
+//     5%..50% → Unverified; > 50% → Unverified + server-unhealthy note.
+//   - A divergence on a TAINTED order — one whose ticker had an earlier
+//     unverifiable event, so the golden book may already differ from reality — is
+//     never turned into Incorrect (a lost order must never become a false fail);
+//     it keeps the run from certifying a pass instead.
+//
+// Exported for direct unit testing. Stream completeness (the end-of-run marker) is
+// checked by the caller in finalize, not here.
 func Replay(events []models.OrderEvent) (models.Verdict, string) {
 	sorted := make([]models.OrderEvent, len(events))
 	copy(sorted, events)
@@ -239,6 +257,25 @@ func Replay(events []models.OrderEvent) (models.Verdict, string) {
 	observed := make(map[string][]observedFill)
 	var aggressorOrder []string // bot order_ids of intents, in seq order
 	var maxSeq uint64           // highest seq seen — the end-of-run marker in a complete run
+
+	aggTicker := make(map[string]string) // aggressor order_id -> ticker
+	aggSeq := make(map[string]uint64)    // aggressor order_id -> seq
+	// firstUnverifiableSeq[ticker] is the earliest seq at which that ticker's book
+	// became untrustworthy (a lost/unknown order). A later divergence on the same
+	// ticker may be an artifact of that loss, not a real bug.
+	firstUnverifiableSeq := make(map[string]uint64)
+	markTaint := func(ticker string, seq uint64) {
+		if ticker == "" {
+			return
+		}
+		if cur, ok := firstUnverifiableSeq[ticker]; !ok || seq < cur {
+			firstUnverifiableSeq[ticker] = seq
+		}
+	}
+
+	totalAttempts := 0    // OK + REJECTED + UNKNOWN intents (the denominator)
+	unknownCount := 0     // attempts with an UNKNOWN outcome
+	globalTaint := false  // a loss of unknown ticker (gap/orphan) taints every book
 
 	for _, ev := range sorted {
 		if ev.Seq != 0 {
@@ -254,25 +291,26 @@ func Replay(events []models.OrderEvent) (models.Verdict, string) {
 			continue
 		}
 
-		// Attempt outcome (stamped by the bot on every intent) decides whether this
-		// order is trustworthy input. Its seq is already counted above, so a rejected
-		// order keeps the stream contiguous without polluting the golden model.
+		// Attempt outcome (stamped by the bot on every intent) classifies trust.
 		switch strings.ToUpper(strings.TrimSpace(ev.Outcome)) {
 		case "UNKNOWN":
 			// The bot never learned what the server did (timeout, 5xx, or an
-			// unparsable response). The server may have mutated its book, so the
-			// golden model can no longer be trusted against reality — fail safe.
-			return models.VerdictUnverified, fmt.Sprintf(
-				"order_id=%s (seq=%d) had an unknown outcome (timeout/5xx/unparsable response) — the server may have applied it, so the book cannot be verified",
-				ev.OrderID, ev.Seq)
+			// unparsable response). The server may have mutated this ticker's book, so
+			// taint it — but tolerate a few rather than sinking the whole run.
+			totalAttempts++
+			unknownCount++
+			markTaint(ev.Ticker, ev.Seq)
+			continue
 		case "REJECTED":
-			// Cleanly rejected by the server (4xx): it never entered the book. Skip
-			// it as a no-op; its seq already counts toward sequence continuity.
+			// Cleanly rejected by the server (4xx): never entered the book. No-op; its
+			// seq already counts toward sequence continuity.
+			totalAttempts++
 			continue
 		}
 
 		switch strings.ToUpper(strings.TrimSpace(ev.Action)) {
 		case "BUY", "SELL":
+			totalAttempts++
 			side := strings.ToUpper(strings.TrimSpace(ev.Action))
 			if ev.ContestantOrderID != 0 {
 				serverToBot[ev.ContestantOrderID] = ev.OrderID
@@ -281,8 +319,11 @@ func Replay(events []models.OrderEvent) (models.Verdict, string) {
 			trades := book.submit(ev.OrderID, side, ev.OrderType, toTick(ev.Price), ev.Volume)
 			expected[ev.OrderID] = &aggressorExpectation{trades: trades}
 			aggressorOrder = append(aggressorOrder, ev.OrderID)
+			aggTicker[ev.OrderID] = ev.Ticker
+			aggSeq[ev.OrderID] = ev.Seq
 
 		case "CANCEL":
+			totalAttempts++
 			if ev.CancelTargetID == 0 {
 				continue
 			}
@@ -312,48 +353,93 @@ func Replay(events []models.OrderEvent) (models.Verdict, string) {
 		}
 	}
 
-	// Stream completeness by sequence continuity. Every correctness order reserves
-	// a monotonic seq (from 1) BEFORE the request is sent; a lost response — a
-	// timeout, a read/connection error, or a 200 whose order_id could not be parsed
-	// — burns that seq but records no event, leaving a hole. Trades and the
-	// end-of-run marker draw from the same counter and are always emitted, so a
-	// complete run's seqs are exactly {1..maxSeq} with no gap. A gap means an order
-	// reached the server (mutating its book) yet we never captured it: from that
-	// point the golden model replays a different book than the contestant actually
-	// faced, which can surface as a false "incorrect" on a fully correct engine
-	// (e.g. a lost aggressor that consumed liquidity the golden model still sees).
-	// Missing input can never yield a trustworthy verdict, so report Unverified —
-	// never a false failure (the paramount constraint). This also catches events
-	// dropped anywhere in the telemetry pipeline, not just bot-side request losses.
-	if maxSeq > 0 && uint64(len(seen)) != maxSeq {
-		return models.VerdictUnverified, fmt.Sprintf(
-			"captured stream has a sequence gap: %d distinct events but seq runs to %d — an order was lost in flight (incomplete telemetry)",
-			len(seen), maxSeq)
+	// Sequence gaps: a complete run's seqs are exactly {1..maxSeq} (every attempt
+	// and trade reserves one). A hole is an event lost in flight; its ticker is
+	// unknown, so it taints every book. Count each hole toward unverifiability.
+	gap := 0
+	if maxSeq > 0 && uint64(len(seen)) < maxSeq {
+		gap = int(maxSeq - uint64(len(seen)))
+		globalTaint = true
 	}
 
-	// A fill whose aggressor never submitted an intent means the captured stream
-	// is incomplete (telemetry loss, or a 200 response whose order_id we could not
-	// parse). We cannot soundly compare counterparties on missing input, so the
-	// verdict is Unverified — never a false "incorrect" (the paramount constraint)
-	// and never a silent "correct". Sorted for a reproducible verdict reason.
-	var orphans []string
+	// Orphan fills: a fill whose aggressor never submitted an intent — a lost
+	// intent of unknown ticker, so also a global taint.
+	orphan := 0
 	for agg := range observed {
 		if _, ok := expected[agg]; !ok {
-			orphans = append(orphans, agg)
+			orphan++
+			globalTaint = true
 		}
-	}
-	if len(orphans) > 0 {
-		sort.Strings(orphans)
-		return models.VerdictUnverified, fmt.Sprintf(
-			"order_id=%s reported fills but was never captured as an intent (incomplete telemetry)", orphans[0])
 	}
 
+	// Per-aggressor diff in seq order. A divergence on untainted input is a real
+	// bug (hard Incorrect); on tainted input it may be an artifact of an earlier
+	// loss, so it only blocks certification. An unknown-maker fill is itself an
+	// unverifiable point that taints its ticker onward.
+	tainted := func(aggID string) bool {
+		if globalTaint {
+			return true
+		}
+		s, ok := firstUnverifiableSeq[aggTicker[aggID]]
+		return ok && aggSeq[aggID] > s
+	}
+	hardIncorrect := ""
+	taintedMismatch := 0
+	unverifiableFills := 0
 	for _, aggID := range aggressorOrder {
-		if v, reason := diffAggressor(aggID, expected[aggID], observed[aggID]); v != models.VerdictCorrect {
-			return v, reason
+		v, reason := diffAggressor(aggID, expected[aggID], observed[aggID])
+		switch v {
+		case models.VerdictIncorrect:
+			if tainted(aggID) {
+				taintedMismatch++
+				markTaint(aggTicker[aggID], aggSeq[aggID])
+			} else if hardIncorrect == "" {
+				hardIncorrect = reason
+			}
+		case models.VerdictUnverified:
+			unverifiableFills++
+			markTaint(aggTicker[aggID], aggSeq[aggID])
 		}
 	}
-	return models.VerdictCorrect, ""
+
+	// A real, trustworthy divergence always fails — no tolerance for genuine bugs.
+	if hardIncorrect != "" {
+		return models.VerdictIncorrect, hardIncorrect
+	}
+
+	unverifiable := unknownCount + gap + orphan + unverifiableFills + taintedMismatch
+	// A divergence we could not attribute to a real bug (tainted, or an unknown
+	// maker/orphan) means we cannot certify a clean pass even if the fraction is low.
+	unresolvedDivergence := taintedMismatch > 0 || unverifiableFills > 0 || orphan > 0
+
+	if totalAttempts == 0 {
+		if unverifiable == 0 {
+			return models.VerdictCorrect, ""
+		}
+		return models.VerdictUnverified, "no verifiable orders in the run"
+	}
+
+	breakdown := fmt.Sprintf("unknown=%d gap=%d orphan=%d unknown_maker=%d tainted_mismatch=%d",
+		unknownCount, gap, orphan, unverifiableFills, taintedMismatch)
+
+	frac := float64(unverifiable) / float64(totalAttempts)
+	switch {
+	case frac > unhealthyThreshold:
+		return models.VerdictUnverified, fmt.Sprintf(
+			"server unhealthy: %d of %d order attempts could not be verified (%.0f%% — timeouts/errors/lost telemetry) [%s]",
+			unverifiable, totalAttempts, frac*100, breakdown)
+	case frac >= unknownTolerance:
+		return models.VerdictUnverified, fmt.Sprintf(
+			"%d of %d order attempts could not be verified (%.1f%%), above the %.0f%% tolerance to certify a pass [%s]",
+			unverifiable, totalAttempts, frac*100, unknownTolerance*100, breakdown)
+	case unresolvedDivergence:
+		return models.VerdictUnverified, fmt.Sprintf(
+			"%d of %d order attempts unverifiable (%.1f%%, within tolerance) but a divergence on tainted input could not be cleared — cannot certify a pass",
+			unverifiable, totalAttempts, frac*100)
+	default:
+		// Below tolerance and nothing diverged that we could not clear → certify.
+		return models.VerdictCorrect, ""
+	}
 }
 
 // ── Differential comparison ──────────────────────────────────────────────────

@@ -128,11 +128,13 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleLeaderboard(w http.ResponseWriter, r *http.Request) {
-	// Return just the leaderboard table fragment (used by HTMX hx-get)
-	metrics, err := fetchCurrentLeaderboard(r.Context(), dbPool)
+	// Return just the leaderboard table fragment (used by HTMX hx-get).
+	// Sourced from the Redis leaderboard_state hash so the tri-state verdict
+	// (correct/incorrect/unverified) is preserved, not flattened to a boolean.
+	metrics, err := fetchLeaderboardState(r.Context(), rdb)
 	if err != nil {
-		log.Printf("[Handler] DB error: %v", err)
-		http.Error(w, "db error", 500)
+		log.Printf("[Handler] state fetch error: %v", err)
+		http.Error(w, "state error", 500)
 		return
 	}
 
@@ -158,7 +160,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Send current leaderboard state immediately to this new client
 	go func() {
-		metrics, err := fetchCurrentLeaderboard(context.Background(), dbPool)
+		metrics, err := fetchLeaderboardState(context.Background(), rdb)
 		if err != nil {
 			log.Printf("[WS] Initial fetch error: %v", err)
 			return

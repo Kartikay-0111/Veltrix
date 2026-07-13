@@ -331,8 +331,8 @@ func TestReplayLostResponseIsUnverifiedNotIncorrect(t *testing.T) {
 	if v != models.VerdictUnverified {
 		t.Fatalf("lost response must be Unverified, got %s (reason=%q)", v, reason)
 	}
-	if !strings.Contains(reason, "sequence gap") {
-		t.Fatalf("reason %q should cite the sequence gap", reason)
+	if !strings.Contains(reason, "could not be verified") {
+		t.Fatalf("reason %q should cite unverifiable attempts", reason)
 	}
 }
 
@@ -369,12 +369,13 @@ func TestReplayUnknownOutcomeIsUnverified(t *testing.T) {
 		intent(1, "S1", "SELL", "LIMIT", "AAA", 100, 10, 1),
 		withOutcome("UNKNOWN", intent(2, "B1", "BUY", "LIMIT", "AAA", 100, 10, 2)),
 	}
+	// 1 unknown of 2 attempts = 50% — well above tolerance, so Unverified.
 	v, reason := Replay(events)
 	if v != models.VerdictUnverified {
 		t.Fatalf("unknown outcome must be Unverified, got %s (reason=%q)", v, reason)
 	}
-	if !strings.Contains(reason, "unknown outcome") {
-		t.Fatalf("reason %q should cite the unknown outcome", reason)
+	if !strings.Contains(reason, "could not be verified") {
+		t.Fatalf("reason %q should cite unverifiable attempts", reason)
 	}
 }
 
@@ -483,6 +484,128 @@ func TestReplayDedupesRedeliveredFill(t *testing.T) {
 	}
 	if v, reason := Replay(events); v != models.VerdictCorrect {
 		t.Fatalf("duplicate fill must be deduped and stay correct, got %s: %s", v, reason)
+	}
+}
+
+// ── tolerance-policy runs ──────────────────────────────────────────────────────
+// runBuilder assembles a contiguous-seq run so tests exercise the fractional
+// verdict policy without accidental gaps.
+type runBuilder struct {
+	seq    uint64
+	srvID  uint64
+	events []models.OrderEvent
+}
+
+func (b *runBuilder) tick() uint64 { b.seq++; return b.seq }
+func (b *runBuilder) srv() uint64  { b.srvID++; return b.srvID }
+
+// cleanCross: a SELL rests, a BUY fully crosses it, and the reported fill agrees
+// with the golden model. Book returns empty, so it may be repeated on one ticker.
+func (b *runBuilder) cleanCross(ticker string) {
+	s := b.srv()
+	bid := fmt.Sprintf("B-%d", s)
+	b.events = append(b.events,
+		intent(b.tick(), fmt.Sprintf("S-%d", s), "SELL", "LIMIT", ticker, 100, 10, s))
+	b.events = append(b.events,
+		intent(b.tick(), bid, "BUY", "LIMIT", ticker, 100, 10, b.srv()))
+	b.events = append(b.events, fill(b.tick(), bid, s, 100, 10))
+}
+
+// unknown: an order whose outcome the bot could not confirm (consumes a seq, emits
+// no fill), tainting its ticker.
+func (b *runBuilder) unknown(ticker string) {
+	b.events = append(b.events, withOutcome("UNKNOWN",
+		intent(b.tick(), fmt.Sprintf("U-%d", b.seq+1), "BUY", "LIMIT", ticker, 100, 10, 0)))
+}
+
+// overFill: a crossing pair whose reported fill qty (20) exceeds what the golden
+// model matches (10) — a real matching divergence on this ticker.
+func (b *runBuilder) overFill(ticker string) {
+	s := b.srv()
+	bid := fmt.Sprintf("B-%d", s)
+	b.events = append(b.events,
+		intent(b.tick(), fmt.Sprintf("S-%d", s), "SELL", "LIMIT", ticker, 100, 10, s))
+	b.events = append(b.events,
+		intent(b.tick(), bid, "BUY", "LIMIT", ticker, 100, 10, b.srv()))
+	b.events = append(b.events, fill(b.tick(), bid, s, 100, 20))
+}
+
+// TestReplayToleratesFewUnknowns: a handful of transient blips among many good
+// requests (here 1 of 41 ≈ 2.4%, under the 5% tolerance) must NOT sink a correct
+// run — this is the whole point of the policy change.
+func TestReplayToleratesFewUnknowns(t *testing.T) {
+	b := &runBuilder{}
+	for i := 0; i < 20; i++ {
+		b.cleanCross("AAA")
+	}
+	b.unknown("BBB")
+	if v, reason := Replay(b.events); v != models.VerdictCorrect {
+		t.Fatalf("1 unknown of 41 attempts (2.4%%) must stay Correct, got %s: %s", v, reason)
+	}
+}
+
+// TestReplayAboveToleranceUnverified: past 5% unverifiable (3 of 43 ≈ 7%) there is
+// too much unchecked to certify a pass → Unverified (not a fail).
+func TestReplayAboveToleranceUnverified(t *testing.T) {
+	b := &runBuilder{}
+	for i := 0; i < 20; i++ {
+		b.cleanCross("AAA")
+	}
+	for i := 0; i < 3; i++ {
+		b.unknown("BBB")
+	}
+	if v, _ := Replay(b.events); v != models.VerdictUnverified {
+		t.Fatalf("7%% unknown must be Unverified, got %s", v)
+	}
+}
+
+// TestReplayMostlyErrorsUnhealthy: past 50% failure the server is flagged
+// unhealthy (still Unverified, never Incorrect — mass errors are a liveness
+// problem, not a proven matching bug).
+func TestReplayMostlyErrorsUnhealthy(t *testing.T) {
+	b := &runBuilder{}
+	for i := 0; i < 2; i++ {
+		b.cleanCross("AAA")
+	}
+	for i := 0; i < 10; i++ {
+		b.unknown("BBB")
+	}
+	v, reason := Replay(b.events)
+	if v != models.VerdictUnverified {
+		t.Fatalf("mass errors must be Unverified, got %s", v)
+	}
+	if !strings.Contains(reason, "unhealthy") {
+		t.Fatalf("reason %q should flag the server as unhealthy", reason)
+	}
+}
+
+// TestReplayRealBugSurvivesUnknownElsewhere: a genuine matching bug on a clean
+// (untainted) ticker is still Incorrect even though an unrelated request failed —
+// real bugs get no tolerance budget.
+func TestReplayRealBugSurvivesUnknownElsewhere(t *testing.T) {
+	b := &runBuilder{}
+	for i := 0; i < 5; i++ {
+		b.cleanCross("AAA")
+	}
+	b.unknown("BBB")  // transient blip on an unrelated ticker
+	b.overFill("CCC") // real over-fill bug on a clean ticker
+	if v, reason := Replay(b.events); v != models.VerdictIncorrect {
+		t.Fatalf("a real bug on a clean ticker must be Incorrect, got %s: %s", v, reason)
+	}
+}
+
+// TestReplayTaintedMismatchNotIncorrect: a divergence on a ticker already tainted
+// by an earlier lost order could be an artifact of that loss, so it must never
+// become a false Incorrect — it downgrades the run to Unverified instead.
+func TestReplayTaintedMismatchNotIncorrect(t *testing.T) {
+	b := &runBuilder{}
+	b.unknown("AAA")   // taints AAA from the start
+	b.overFill("AAA")  // divergence on tainted AAA — could be an artifact
+	for i := 0; i < 30; i++ {
+		b.cleanCross("ZZZ") // dilute so the fraction stays under tolerance
+	}
+	if v, reason := Replay(b.events); v != models.VerdictUnverified {
+		t.Fatalf("tainted divergence must be Unverified, not Incorrect, got %s: %s", v, reason)
 	}
 }
 

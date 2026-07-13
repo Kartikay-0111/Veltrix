@@ -20,7 +20,26 @@ type MetricMessage struct {
 	P50Ms        float64 `json:"p50_ms"`
 	P90Ms        float64 `json:"p90_ms"`
 	P99Ms        float64 `json:"p99_ms"`
-	IsCorrect    bool    `json:"is_correct"`
+	// Status is the tri-state verdict from the checker: "correct" | "incorrect" |
+	// "unverified". IsCorrect is the legacy boolean (true only for "correct").
+	Status    string `json:"status"`
+	IsCorrect bool   `json:"is_correct"`
+}
+
+// Verdict normalizes the tri-state for the template. It prefers the explicit
+// Status; if it is missing (e.g. a legacy row that only carried the boolean), a
+// true boolean reads as "correct" and anything else as "unverified" — never a
+// hard "incorrect", so a run that was never conclusively checked is not shown as
+// a failure.
+func (m MetricMessage) Verdict() string {
+	switch m.Status {
+	case "correct", "incorrect", "unverified":
+		return m.Status
+	}
+	if m.IsCorrect {
+		return "correct"
+	}
+	return "unverified"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

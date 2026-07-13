@@ -9,6 +9,7 @@
 #include <chrono>
 #include <pthread.h>
 #include <sched.h>
+#include <system_error>
 // Awaitable operator overloads (e.g. a || b)
 #include <boost/asio/experimental/awaitable_operators.hpp>
 using namespace boost::asio::experimental::awaitable_operators;
@@ -82,14 +83,20 @@ static ParsedResponse parse_response(const std::string &body)
     if (body.empty())
         return out;
 
+    // Parse the FIRST complete JSON value and tolerate trailing bytes. An HTTP
+    // keep-alive read can leave the next response's prefetched bytes after this
+    // body in the buffer; strict json::parse throws "extra data" on that and would
+    // mis-tag a perfectly valid 200 as UNKNOWN. stream_parser stops at the end of
+    // the first value, so a genuinely malformed prefix still fails (→ UNKNOWN)
+    // while a clean value followed by pipelined bytes parses correctly.
     json::value root;
-    try
     {
-        root = json::parse(body);
-    }
-    catch (const std::exception &)
-    {
-        return out; // malformed → parsed stays false (caller treats as unknown)
+        json::stream_parser p;
+        std::error_code ec;
+        p.write_some(body.data(), body.size(), ec);
+        if (ec || !p.done())
+            return out; // malformed / incomplete → parsed stays false
+        root = p.release();
     }
     if (!root.is_object())
         return out;
@@ -270,8 +277,43 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
     RestBot bot(cfg_.target_host, cfg_.target_port, bot_id, cfg_.seed);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(cfg_.duration_secs);
 
+    // Reconnect the (kept-alive) socket after any transport failure. The server
+    // may close a connection — cleanly (Connection: close) or by dropping a request
+    // it failed to handle — and without a fresh socket every subsequent order on
+    // the dead one would time out, cascading a single blip into a run-long stall of
+    // 5s timeouts (which the checker would read as many UNKNOWNs and refuse to
+    // certify a correct server). Reconnecting bounds the damage to the one lost
+    // order.
+    tcp::resolver resolver(executor);
+    auto reconnect = [&]() -> asio::awaitable<void>
+    {
+        boost::system::error_code ec;
+        socket.close(ec);
+        try
+        {
+            auto endpoints = co_await resolver.async_resolve(
+                cfg_.target_host, cfg_.target_port, asio::use_awaitable);
+            co_await asio::async_connect(socket, endpoints, asio::use_awaitable);
+            socket.set_option(tcp::no_delay(true));
+        }
+        catch (const std::exception &)
+        {
+            // Leave the socket closed; the next iteration's write will fail and
+            // trigger another reconnect attempt.
+        }
+    };
+
+    bool need_reconnect = false;
     while (running_ && std::chrono::steady_clock::now() < deadline)
     {
+        // Reconnect at the top of the iteration (co_await is illegal inside the
+        // catch handlers below, so failing paths just set the flag).
+        if (need_reconnect)
+        {
+            co_await reconnect();
+            need_reconnect = false;
+        }
+
         std::string request = bot.generate_request();
         const auto &last = bot.last_order();
 
@@ -349,6 +391,7 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
             {
                 ++counters_.counts[OTHER_ERR];
                 emit_intent(OrderOutcome::Unknown, 0); // response lost mid-read
+                need_reconnect = true;
                 continue;
             }
 
@@ -356,6 +399,7 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
             {
                 record(0, 0.0, true); // count as TIMEOUT only — not a latency sample
                 emit_intent(OrderOutcome::Unknown, 0); // server may have applied it
+                need_reconnect = true;                   // socket likely hung/dead
                 continue;
             }
 
@@ -384,6 +428,7 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
                 {
                     ++counters_.counts[OTHER_ERR];
                     emit_intent(OrderOutcome::Unknown, 0); // body lost mid-read
+                    need_reconnect = true;
                     continue;
                 }
             }
@@ -468,6 +513,7 @@ asio::awaitable<void> ThreadWorker::send_orders(tcp::socket &socket,
         {
             ++counters_.counts[OTHER_ERR];
             emit_intent(OrderOutcome::Unknown, 0); // request write failed / unexpected
+            need_reconnect = true;
         }
     }
 }

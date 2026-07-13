@@ -141,6 +141,7 @@
         }
         .badge-pass { background: #052e16; color: #4ade80; border: 1px solid #16a34a; }
         .badge-fail { background: #2d0d0d; color: #f87171; border: 1px solid #991b1b; }
+        .badge-unverified { background: #2a2410; color: #fbbf24; border: 1px solid #a16207; }
 
         /* Row update flash animation */
         @keyframes flash {
@@ -189,7 +190,7 @@
                             <th>p50 (ms)</th>
                             <th>p90 (ms)</th>
                             <th>p99 (ms)</th>
-                            <th>Correct</th>
+                            <th>Verdict</th>
                         </tr>
                     </thead>
                     <tbody id="leaderboard-body" hx-get="/leaderboard" hx-trigger="load">

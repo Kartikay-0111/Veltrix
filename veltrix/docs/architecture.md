@@ -69,6 +69,18 @@ reference engine (a standard price-time model), diffing per aggressor order:
 
 The contract this enforces is [`matching-spec.md`](matching-spec.md).
 
+Buffering and bookkeeping (the per-submission `buffers`/`finalized` maps) stay on
+a single `Run` goroutine — no locks — but the **CPU-heavy replay is offloaded onto
+worker goroutines** (one per finalized submission, bounded by `GOMAXPROCS`). Each
+submission's events are lifted off the buffer map before hand-off and every replay
+is self-contained, so concurrent replays share no state and cannot change a
+verdict — only the order verdicts land on the updates channel, which the aggregator
+keys by `SubmissionID` and does not depend on. This keeps the `Run` loop draining
+its input continuously, so a burst of end-of-run markers can never stall the
+watermark router or, via back-pressure, the Redpanda consumer (which would
+otherwise risk event loss). `ARTIFACT_CHECKER_GOMAXPROCS` defaults to
+`runtime.NumCPU()` so those workers actually run in parallel.
+
 ### Three-state verdict (fail-safe)
 
 The verdict is one of `correct | incorrect | unverified`. **`unverified` is the
@@ -78,10 +90,27 @@ judge a submission resolves here, never to a silent pass. Sources of `unverified
 - **No end-of-run marker** when the stream is finalized (`finalize` in
   `engine.go`) — the stream was truncated (e.g. a consumer-group rebalance) and a
   verdict on a partial replay is untrustworthy.
+- **An `UNKNOWN` order outcome** — the bot could not confirm what the server did
+  with an order (a `5xx`, a timeout, a dropped connection, or a `200` whose body
+  did not parse). The server may have mutated its book, so the golden model can no
+  longer be trusted against reality.
+- **A gap in the `seq` sequence** — every correctness order reserves a monotonic
+  `seq` *before* it is sent, so a complete run's sequence numbers are exactly
+  `{1..max}` with no hole. A missing `seq` means an order reached the server
+  (mutating its book) yet its record was lost in flight; from that point the golden
+  model would replay a different book than the contestant faced, which could
+  surface as a false `incorrect`. `Replay` detects the gap and returns
+  `unverified` instead. This also catches events dropped anywhere in the telemetry
+  pipeline, not just bot-side losses.
 - **A fill with no captured intent**, or **a fill against a maker id never
   submitted** (`Replay` / `diffAggressor`) — lost telemetry or a response shape
   the grader could not parse. Returning `incorrect` here would risk failing correct
   code, so the sound answer is `unverified`.
+
+A cleanly **`REJECTED`** order (a `4xx` — the server refused it, so its book is
+unchanged) is *not* an unverified source: replay treats it as a no-op, and because
+the bot still emits its `seq`, the sequence stays contiguous. So a well-behaved
+server that rejects invalid orders is graded normally, not stranded as unverified.
 
 The aggregator's per-submission default is `unverified` (never `correct`), so a
 submission whose verdict is lost or never produced does not fail open to a pass.
@@ -115,6 +144,26 @@ be stranded whenever a submission had no new metrics in that window.
   (C10K style), not a thread. So 1000 bots on 8 cores ≈ 8 pinned threads ×
   ~125 coroutine-bots.
 
+### Observation capture (correctness)
+
+For each order in the serialized correctness run, a worker reserves the order's
+`seq` *before* sending, then records **exactly one intent per attempt**, tagged
+with the attempt's **outcome**:
+
+- **OK** — a clean `200` whose body parsed and yielded a server `order_id`; the
+  intent is recorded and the response's `trades[]` are unrolled into fill events.
+- **REJECTED** — a clean `4xx`; the server refused the order (book unchanged).
+- **UNKNOWN** — a timeout, `5xx`, dropped connection, or a `200` that could not be
+  parsed; the outcome is unknowable.
+
+Because every attempt emits its `seq`, a lost or rejected response is never a
+silent hole — the checker sees the outcome and applies the rules above. The HTTP
+response body is parsed with **Boost.JSON** (a conforming reader), not hand-rolled
+string scanning, so unusual-but-valid shapes parse correctly and a malformed body
+is *detected* (→ `UNKNOWN`) rather than silently mis-scanned into a bogus fill —
+the observation stream is the ground truth for "what the contestant did", so it
+must not lie by accident.
+
 ### Shared-fleet serialization
 
 The bot-fleet is a **single shared service** that pins one worker per core, so two
@@ -129,6 +178,11 @@ the sandbox for a queued submission may sit idle briefly while it waits for a sl
 
 - `order_events` are deduped per submission by `seq`, so at-least-once redelivery
   cannot double-count into a false over-fill.
+- Every correctness order carries its `seq`, and a hole in the sequence marks a
+  lost order → `unverified` (per above), so a dropped event cannot silently corrupt
+  the replayed book.
+- Each attempt carries an **outcome** tag (OK / REJECTED / UNKNOWN), so a rejected
+  or lost response is classified rather than dropped.
 - The end-of-run marker gives a deterministic single finalization point (and its
   absence yields `unverified`, per above).
 - telemetry-ingester's Redpanda producer uses a **background context** for async
@@ -140,12 +194,14 @@ the sandbox for a queued submission may sit idle briefly while it waits for a sl
 These are understood gaps, not silent ones; the fail-safe verdict keeps them from
 turning into false passes/fails, but they are worth closing:
 
-- **Transport-truncation detection needs an expected-count in the END marker.**
-  Today a truncated stream is caught only when it drops the END marker or orphans
-  a fill. A robust check is to carry the number of audit events the writer emitted
-  on the END sentinel (proto `event_count` + C++ writer + Go compare) and mark
-  `unverified` when fewer distinct events arrive. Deferred because it spans
-  proto/C++/Go and needs a full rebuild + multi-consumer e2e to verify.
+- **Transport-truncation detection is now sequence-based; an END expected-count
+  would still tighten the tail.** A hole anywhere in the `seq` run is caught as a
+  gap (→ `unverified`), and per-attempt outcome tags remove bot-side silent holes.
+  What sequence-continuity alone cannot see is a truncation *after* the last
+  captured `seq` but *before* the END marker — that is caught only by the missing
+  END. Carrying the writer's total event count on the END sentinel (proto
+  `event_count` + C++ writer + Go compare) would make even that case explicit.
+  Deferred because it spans proto/C++/Go and needs a multi-consumer e2e to verify.
 - **Consumer offset is `AtEnd`.** A consumer-group rebalance can skip in-flight
   correctness events; combined with the above, the result is `unverified` rather
   than a false pass, but manual commit-after-process (and a non-`AtEnd` reset for

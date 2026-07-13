@@ -10,10 +10,12 @@
     <td class="p90-val">{{printf "%.3f" $m.P90Ms}}</td>
     <td class="p99-val">{{printf "%.3f" $m.P99Ms}}</td>
     <td>
-        {{if $m.IsCorrect}}
+        {{if eq $m.Verdict "correct"}}
             <span class="badge badge-pass">PASS</span>
-        {{else}}
+        {{else if eq $m.Verdict "incorrect"}}
             <span class="badge badge-fail">FAIL</span>
+        {{else}}
+            <span class="badge badge-unverified">UNVERIFIED</span>
         {{end}}
     </td>
 </tr>

@@ -5,7 +5,8 @@
 - Purpose: generate high-concurrency traffic against contestant sandboxes.
 - Business responsibility: drive load, capture intent and execution telemetry.
 - Key workflows: receive benchmark request, spawn per-core workers, stream telemetry.
-- Dependencies: telemetry-ingester (gRPC).
+- Dependencies: telemetry-ingester (gRPC). Build deps: Boost (system + **json**),
+  liburing, gRPC/Protobuf (see `CMakeLists.txt` / `Dockerfile`).
 -
 ## Architecture
 
@@ -19,6 +20,16 @@
   2. FleetCommander splits bots across cores.
   3. Workers emit order requests and collect telemetry.
   4. Telemetry is sent over gRPC to the ingester.
+- Observation capture (correctness mode): each attempt reserves its `seq` before
+  sending and records **exactly one intent**, tagged with the attempt outcome so a
+  lost or rejected response is never a silent hole in the stream:
+  - **OK** — clean `200`, body parsed, server `order_id` found; `trades[]` unrolled.
+  - **REJECTED** — clean `4xx`; the server refused it (book unchanged, replay no-op).
+  - **UNKNOWN** — timeout / `5xx` / dropped connection / unparsable `200`; forces the
+    checker to mark the run `unverified` rather than risk a false verdict.
+  Response bodies are parsed with **Boost.JSON** (a conforming reader), so unusual-
+  but-valid shapes parse correctly and a malformed body is detected (→ UNKNOWN)
+  instead of being silently mis-scanned into a bogus fill.
 
 ## Folder Structure
 

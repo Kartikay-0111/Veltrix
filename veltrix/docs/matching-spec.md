@@ -111,12 +111,27 @@ JSON body containing:
 
 A **rejected or malformed** request must return a **non-2xx** status (the
 reference returns 400 for a bad payload, 404 for cancelling an unknown id). The
-grader treats a non-2xx response as *the order was not processed* — neither your
-server nor the golden model applies it. **Do not** return 201/202/204 for a
-*successful* order, or use different trade field names: the grader would drop that
-order from the replay and could misjudge later matches against it. If a 200
-response cannot be parsed, the run is reported **unverified** (below), never a
-pass — but conform to this shape so your run is graded, not skipped.
+grader tags every attempt with an **outcome** so a rejected or lost response is
+never a silent hole in the order stream, and it distinguishes the two:
+
+- **`4xx` — rejected.** The grader records the attempt as `REJECTED`: *the order
+  was not processed*, so neither your server nor the golden model applies it. The
+  sequence stays intact and grading continues normally — a well-behaved server
+  that cleanly rejects invalid orders is **not** penalized or marked unverified.
+- **`5xx`, a timeout, a dropped connection, or a `200` whose body cannot be
+  parsed — unknown.** The grader records the attempt as `UNKNOWN`: the server
+  *may* have applied the order but the outcome could not be confirmed, so the book
+  can no longer be trusted and the run is reported **unverified** (below), never a
+  false failure.
+
+**Do not** return 201/202/204 for a *successful* order, or use different trade
+field names: the grader would be unable to map that order and could misjudge later
+matches against it. Conform to this shape so your run is graded, not skipped.
+
+The response body is parsed with a conforming JSON reader (nested objects, arrays,
+scientific-notation numbers, and arbitrary whitespace are all accepted; `order_id`
+may be an integer or a numeric string), so only a genuinely malformed body trips
+the `UNKNOWN` path.
 
 ## Verdict states
 
@@ -126,4 +141,4 @@ Each submission is graded into one of three states:
 |---------|---------|
 | **correct**    | The full stream replayed and every order agreed with the golden model. |
 | **incorrect**  | A real matching divergence, with a specific reason (over/under-fill, wrong counterparty, out-of-band price, a killed order that filled, …). |
-| **unverified** | The run could **not** be conclusively checked — the end-of-run marker never arrived (truncated stream), or a fill referenced a counterparty/aggressor that was never captured (lost telemetry or an unrecognized response shape). Unverified is **not** a pass and **not** a failure; it is surfaced so the run can be retried. It is also the fail-safe **default**: a submission that was never verified never silently reads as correct. |
+| **unverified** | The run could **not** be conclusively checked. Any of: the end-of-run marker never arrived (truncated stream); an order attempt was tagged `UNKNOWN` (a `5xx`/timeout/unparsable response — the server may have applied it); a **gap in the `seq` sequence** (an order reached the server but its record was lost in flight); or a fill referenced a counterparty/aggressor that was never captured. Unverified is **not** a pass and **not** a failure; it is surfaced so the run can be retried. It is also the fail-safe **default**: a submission that was never verified never silently reads as correct. |
